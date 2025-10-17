@@ -13,7 +13,7 @@ from typing import List, Dict, Any
 AVAILABLE_GPUS = [0, 1, 2, 3]
 
 # 通用设置
-DATASETS = ['small', 'small_3x', 'small_30x']
+DATASETS = ['simple', 'lif', 'small', 'small_3x', 'small_30x']
 
 # 模型专属的超参数网格
 SEARCH_SPACE: List[Dict[str, Any]] = [
@@ -24,8 +24,9 @@ SEARCH_SPACE: List[Dict[str, Any]] = [
             'hidden_channels': [32, 48, 64],
             'num_levels': [4, 6, 8, 10],
             'dropout': [0.2],
-            'input_kernel_size': [7, 15, 31],
-            'weight_decay': [1e-4, 1e-3, 1e-2]
+            'input_kernel_size': [7, 15, 31, 53],
+            'weight_decay': [1e-4, 1e-3, 1e-2],
+            'fusion_mode': ['add', 'ablate']
         }
     },
     {
@@ -36,7 +37,8 @@ SEARCH_SPACE: List[Dict[str, Any]] = [
             'n_layers': [2, 4, 6],
             'd_state': [64],
             'dropout': [0.1],
-            'weight_decay': [1e-4, 1e-3, 1e-2]
+            'weight_decay': [1e-4, 1e-3, 1e-2],
+            'fusion_mode': ['add', 'ablate']
         }
     }
 ]

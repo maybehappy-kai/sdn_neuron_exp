@@ -1,5 +1,6 @@
 import numpy as np
 import os
+from scipy.signal import convolve
 
 # =============================================================================
 # --- 全局参数定义 ---
@@ -8,36 +9,41 @@ DATA_PATH = '~/Data/neuron_data'
 TIMESTEPS = 100000
 INPUT_CHANNELS = 20
 OUTPUT_CHANNELS = 7
-# 回归到 1% 的输入稀疏度
 SPIKE_PROBABILITY = 0.01
 
 
 # =============================================================================
-# --- 数据集 1: 简单的线性映射 + Sigmoid (初始版本) ---
+# --- 数据集 1: 平滑的线性映射 ---
 # =============================================================================
 def create_simple_dataset(base_path):
     """
-    创建一个简单的、通过线性变换和非线性激活函数生成的玩具数据集。
+    创建一个平滑的、通过线性变换生成的玩具数据集。
     """
-    print("--- 正在创建数据集 1: 简单映射 (初始版本) ---")
+    print("--- 正在创建数据集 1: 简单平滑映射 ---")
 
-    # 1. 创建输入数据 v0
-    v0_data = np.full((1, INPUT_CHANNELS, TIMESTEPS), -70, dtype=np.int8)
+    # *** 更正部分 1: 直接生成只包含 0 和 1 的 v0 数据 ***
+    v0_data = np.zeros((1, INPUT_CHANNELS, TIMESTEPS), dtype=np.int8)
     np.random.seed(42)
     spike_mask = np.random.rand(1, INPUT_CHANNELS, TIMESTEPS) < SPIKE_PROBABILITY
-    v0_data[spike_mask] = 30
-    v0_binary = (v0_data == 30).astype(np.float32)
+    v0_data[spike_mask] = 1
 
-    # 2. 定义转换矩阵
+    # 定义转换矩阵
     transform_matrix = np.random.randn(INPUT_CHANNELS, OUTPUT_CHANNELS) * 0.5
-    v1_transformed = np.dot(v0_binary[0].T, transform_matrix).T
+    # 直接使用 v0_data[0] 进行计算
+    v1_transformed = np.dot(v0_data[0].T.astype(np.float32), transform_matrix).T
 
-    # 3. 创建 v1 主体 (无平滑)
+    # 对变换后的信号进行平滑处理
+    smoothing_window = np.ones(100) / 100.0
+    v1_smoothed = np.zeros_like(v1_transformed)
+    for i in range(OUTPUT_CHANNELS):
+        v1_smoothed[i, :] = convolve(v1_transformed[i, :], smoothing_window, mode='same')
+
+    # 基于平滑后的信号生成v1
     v1_main = np.zeros((OUTPUT_CHANNELS, TIMESTEPS), dtype=np.float32)
-    v1_main[:6, :] = 1 / (1 + np.exp(-v1_transformed[:6, :]))
-    v1_main[6, :] = (v1_transformed[6, :] > 0.74).astype(np.float32)
+    v1_main[:6, :] = 1 / (1 + np.exp(-v1_smoothed[:6, :]))
+    v1_main[6, :] = (v1_smoothed[6, :] > 0.025).astype(np.float32)
 
-    # 4. 组合并保存
+    # 组合并保存
     initial_state = np.zeros((OUTPUT_CHANNELS, 1), dtype=np.float32)
     v1_data = np.concatenate([initial_state, v1_main], axis=1)[np.newaxis, :, :]
 
@@ -52,32 +58,28 @@ def create_simple_dataset(base_path):
 
 
 # =============================================================================
-# --- 数据集 2: Leaky Integrate-and-Fire (LIF) 神经元 (初始版本) ---
+# --- 数据集 2: 平滑且稀疏的LIF神经元 ---
 # =============================================================================
 def create_lif_dataset(base_path):
     """
-    创建一个基于LIF神经元动力学的玩具数据集 (初始版本)。
+    创建一个膜电位平滑、脉冲发放稀疏的LIF数据集。
     """
-    print("--- 正在创建数据集 2: LIF 神经元 (初始版本) ---")
+    print("--- 正在创建数据集 2: 平滑稀疏LIF神经元 ---")
 
-    # 1. 创建输入数据 v0
-    v0_data = np.full((1, INPUT_CHANNELS, TIMESTEPS), -70, dtype=np.int8)
+    # *** 更正部分 2: 直接生成只包含 0 和 1 的 v0 数据 ***
+    v0_data = np.zeros((1, INPUT_CHANNELS, TIMESTEPS), dtype=np.int8)
     np.random.seed(1337)
     spike_mask = np.random.rand(1, INPUT_CHANNELS, TIMESTEPS) < SPIKE_PROBABILITY
-    v0_data[spike_mask] = 30
-    v0_binary = (v0_data == 30).astype(np.float32)
+    v0_data[spike_mask] = 1
 
-    # 2. 计算输入电流，使用能产生较多脉冲的原始参数
-    input_current = np.sum(v0_binary[0], axis=0) * 0.25
-
-    # 3. 定义LIF参数 (回归到初始值)
-    tau_m = 10.0  # 较小的时间常数，响应更快
-    v_thresh = 1.0  # 阈值电位
-    v_reset = 0.0  # 硬复位电位
-    dt = 1.0  # 时间步长 (ms)
+    # 使用固定的、较小的电流缩放系数，并增大时间常数
+    # 直接使用 v0_data[0] 进行计算
+    input_current = np.sum(v0_data[0], axis=0) * 0.13
+    tau_m = 25.0
+    v_thresh, v_reset, dt = 1.0, 0.0, 1.0
     alpha = np.exp(-dt / tau_m)
 
-    # 4. 模拟神经元动态
+    # 模拟神经元动态
     v_mem = np.zeros(TIMESTEPS, dtype=np.float32)
     spikes = np.zeros(TIMESTEPS, dtype=np.float32)
     v = 0.0
@@ -88,14 +90,14 @@ def create_lif_dataset(base_path):
             v = v_reset
         v_mem[t] = v
 
-    # 5. 创建 v1
+    # 创建 v1
     v1_main = np.zeros((OUTPUT_CHANNELS, TIMESTEPS), dtype=np.float32)
     normalized_v_mem = (v_mem - v_mem.min()) / (v_mem.max() - v_mem.min() + 1e-8)
     for i in range(6):
         v1_main[i, :] = normalized_v_mem
     v1_main[6, :] = spikes
 
-    # 6. 组合并保存
+    # 组合并保存
     initial_state = np.zeros((OUTPUT_CHANNELS, 1), dtype=np.float32)
     v1_data = np.concatenate([initial_state, v1_main], axis=1)[np.newaxis, :, :]
 
