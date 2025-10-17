@@ -148,9 +148,10 @@ class S4Block(nn.Module):
 class S4DModel(nn.Module):
     """ 最终的S4D模型 """
 
-    def __init__(self, input_channels, output_channels, d_model, n_layers, d_state=64, l_max=1024, dropout=0.1):
+    def __init__(self, input_channels, output_channels, d_model, n_layers, d_state=64, l_max=1024, dropout=0.1, fusion_mode: str = 'add'):
         super().__init__()
         self.d_model = d_model
+        self.fusion_mode = fusion_mode
 
         self.input_proj = nn.Linear(input_channels, d_model)
         self.state_conditioner = nn.Linear(output_channels, d_model)
@@ -168,8 +169,14 @@ class S4DModel(nn.Module):
 
         # 1. 输入投影和状态调节
         stim_features = self.input_proj(stimulus_seq)
-        state_embedding = self.state_conditioner(initial_state)
-        fused_features = stim_features + state_embedding.unsqueeze(1)  # 广播
+        # --- 根据 fusion_mode 执行不同逻辑 ---
+        if self.fusion_mode == 'add':
+            state_embedding = self.state_conditioner(initial_state)
+            fused_features = stim_features + state_embedding.unsqueeze(1)
+        elif self.fusion_mode == 'ablate':
+            fused_features = stim_features
+        else:
+            raise ValueError(f"Unknown fusion mode: {self.fusion_mode}")
 
         # 2. 通过S4核心
         x = fused_features

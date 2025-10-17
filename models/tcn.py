@@ -57,40 +57,37 @@ class TemporalBlock(nn.Module):
 class TCNModel(nn.Module):
     """
     带状态调节功能的TCN模型。
-
-    该模型接收刺激序列和初始状态作为输入，预测未来的电压和脉冲。
-
-    参数:
-        input_channels (int): 输入刺激的通道数 (v0部分, e.g., 20)。
-        output_channels (int): 输出状态的通道数 (v1部分, e.g., 7)。
-        num_hidden_channels (List[int]): 一个列表，定义了TCN每个残差块的隐藏通道数。列表的长度决定了TCN的层数。
-        input_kernel_size (int): 第一个"事件探测"层的卷积核大小。
-        tcn_kernel_size (int): TCN核心模块的卷积核大小。
-        dropout (float): Dropout比率。
+    (已更新: 第一层使用完整的TemporalBlock以进行更强大的初始处理)
     """
 
     def __init__(self, input_channels: int, output_channels: int, num_hidden_channels: List[int],
-                 input_kernel_size: int, tcn_kernel_size: int, dropout: float = 0.2):
+                 input_kernel_size: int, tcn_kernel_size: int, dropout: float = 0.2, fusion_mode: str = 'add'):
         super(TCNModel, self).__init__()
+        self.fusion_mode = fusion_mode
 
-        # --- 1. “事件探测”输入层 ---
-        # 使用较大卷积核处理稀疏的原始刺激输入，并保持因果性
-        self.event_detector = nn.Sequential(
-            nn.Conv1d(input_channels, num_hidden_channels[0], kernel_size=input_kernel_size,
-                      padding=(input_kernel_size - 1)),
-            nn.ReLU()
+        # --- ★★★ 关键修改 1: 用一个TemporalBlock替换原来的第一层 ★★★ ---
+        # 我们现在使用一个完整的、带有残差连接的TemporalBlock作为“事件探测器”。
+        # 它的空洞因子固定为1，因为它负责初始的、非空洞的特征提取。
+        self.input_processor = TemporalBlock(
+            n_inputs=input_channels,
+            n_outputs=num_hidden_channels[0],
+            kernel_size=input_kernel_size,
+            stride=1,
+            dilation=1,  # 第一层空洞因子为1
+            padding=(input_kernel_size - 1) * 1,  # 因果填充
+            dropout=dropout
         )
 
-        # --- 2. “状态调节”模块 ---
-        # 使用一个线性层将初始状态向量投影到第一个TCN层的隐藏维度
+        # --- 状态调节模块 (不变) ---
         self.state_conditioner = nn.Linear(output_channels, num_hidden_channels[0])
 
-        # --- 3. TCN核心 ---
+        # --- TCN核心 (逻辑微调，现在从第二层开始) ---
         layers = []
         num_levels = len(num_hidden_channels)
-        for i in range(num_levels):
-            dilation_size = 2 ** i
-            in_channels = num_hidden_channels[i - 1] if i > 0 else num_hidden_channels[0]
+        # 循环从i=1开始，因为i=0（第一层）已经被上面的input_processor处理了
+        for i in range(1, num_levels):
+            dilation_size = 2 ** (i)  # 空洞因子从2开始
+            in_channels = num_hidden_channels[i - 1]
             out_channels = num_hidden_channels[i]
 
             layers.append(TemporalBlock(in_channels, out_channels, tcn_kernel_size, stride=1, dilation=dilation_size,
@@ -98,39 +95,31 @@ class TCNModel(nn.Module):
 
         self.tcn_core = nn.Sequential(*layers)
 
-        # --- 4. 输出层 ---
-        # 使用一个1x1卷积将最终的隐藏状态映射回7个输出通道
+        # --- 输出层 (不变) ---
         self.output_layer = nn.Conv1d(num_hidden_channels[-1], output_channels, 1)
 
     def forward(self, stimulus_seq: torch.Tensor, initial_state: torch.Tensor) -> torch.Tensor:
         """
-        模型的前向传播。
-
-        参数:
-            stimulus_seq (Tensor): 刺激输入序列，形状为 [batch, input_channels, seq_len]。
-            initial_state (Tensor): 片段的初始状态（上下文状态），形状为 [batch, output_channels]。
-
-        返回:
-            Tensor: 预测的输出序列，形状为 [batch, output_channels, seq_len]。
+        模型的前向传播 (已更新)
         """
-        # 1. 处理刺激序列
-        stim_features = self.event_detector(stimulus_seq)
-        # 裁剪掉因果卷积产生的右侧padding
-        stim_features = stim_features[:, :, :-self.event_detector[0].padding[0]]
+        # 1. 通过新的、更强大的输入处理器
+        # TemporalBlock内部会自己处理因果卷积的padding裁剪，所以这里更简洁
+        stim_features = self.input_processor(stimulus_seq)
 
         # 2. 处理并广播初始状态
-        state_embedding = self.state_conditioner(initial_state)  # -> [batch, hidden_channels]
-        # unsqueeze增加一个维度 -> [batch, hidden_channels, 1]
-        # expand_as使其形状与stim_features匹配，以便广播相加
-        state_embedding_broadcasted = state_embedding.unsqueeze(2).expand_as(stim_features)
+        if self.fusion_mode == 'add':
+            state_embedding = self.state_conditioner(initial_state)
+            state_embedding_broadcasted = state_embedding.unsqueeze(2).expand_as(stim_features)
+            fused_features = stim_features + state_embedding_broadcasted
+        elif self.fusion_mode == 'ablate':
+            fused_features = stim_features
+        else:
+            raise ValueError(f"Unknown fusion mode: {self.fusion_mode}")
 
-        # 3. 融合状态与刺激特征
-        fused_features = stim_features + state_embedding_broadcasted
-
-        # 4. 通过TCN核心
+        # 3. 通过TCN核心
         tcn_output = self.tcn_core(fused_features)
 
-        # 5. 通过输出层得到最终预测
+        # 4. 通过输出层得到最终预测
         prediction = self.output_layer(tcn_output)
 
         return prediction

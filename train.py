@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
 
 from models.tcn import TCNModel
 from models.s4d import S4DModel
@@ -116,7 +117,7 @@ def calculate_metrics(predictions, targets):
 # --- 5. 评估函数 (自回归生成) ---
 # [最终修正版 v3 - 简洁正确]
 @torch.no_grad()
-def evaluate(model, dataset, device, seq_len, overlap_size):
+def evaluate(model, dataset, device, seq_len, overlap_size, return_predictions=False):
     model.eval()
 
     if overlap_size >= seq_len:
@@ -175,7 +176,71 @@ def evaluate(model, dataset, device, seq_len, overlap_size):
     final_prediction = torch.cat(all_predictions, dim=2)
     final_target = full_v1_target[:, :, 1:final_prediction.shape[2] + 1]
 
-    return calculate_metrics(final_prediction, final_target)
+    metrics = calculate_metrics(final_prediction, final_target)
+
+    if return_predictions:
+        return metrics, final_prediction, final_target  # <--- 如果标志为True，返回三个值
+    else:
+        return metrics  # <--- 否则，保持原样
+
+
+def plot_test_results(predictions, targets, output_path):
+    """
+    在测试集上生成并保存可视化对比图。
+
+    Args:
+        predictions (torch.Tensor): 模型的完整预测输出 (B, C, L)。
+        targets (torch.Tensor): 完整的真实目标 (B, C, L)。
+        output_path (str): 图片保存的完整路径 (包含文件名)。
+    """
+    # 将Tensor移动到CPU并转换为Numpy数组
+    preds_np = predictions.squeeze(0).cpu().numpy()
+    targets_np = targets.squeeze(0).cpu().numpy()
+
+    # --- 1. 提取胞体电位 (Soma Voltage) 数据 (倒数第二个通道，索引为5) ---
+    soma_pred = preds_np[5, :]
+    soma_true = targets_np[5, :]
+    timesteps = np.arange(len(soma_true))
+
+    # --- 2. 提取和处理脉冲数据 (最后一个通道，索引为6) ---
+    spike_logits_pred = preds_np[6, :]
+    spike_prob_pred = 1 / (1 + np.exp(-spike_logits_pred))  # Sigmoid激活
+    spike_binary_pred = (spike_prob_pred > 0.5).astype(int)
+    spike_true = targets_np[6, :].astype(int)
+
+    # --- 3. 计算 TP, FP, FN ---
+    tp = np.where((spike_binary_pred == 1) & (spike_true == 1))[0]
+    fp = np.where((spike_binary_pred == 1) & (spike_true == 0))[0]
+    fn = np.where((spike_binary_pred == 0) & (spike_true == 1))[0]
+
+    # --- 4. 绘图 ---
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(20, 10), sharex=True,
+                                   gridspec_kw={'height_ratios': [3, 1]})
+    fig.suptitle('Final Test Set Evaluation', fontsize=16)
+
+    # 子图1: 胞体电位对比
+    ax1.plot(timesteps, soma_true, label='Ground Truth Voltage', color='royalblue', linewidth=2)
+    ax1.plot(timesteps, soma_pred, label='Predicted Voltage', color='darkorange', linestyle='--', linewidth=1.5)
+    ax1.set_title('Soma Membrane Potential (Channel 5)')
+    ax1.set_ylabel('Membrane Potential (mV)')
+    ax1.legend()
+    ax1.grid(True, linestyle=':', alpha=0.6)
+
+    # 子图2: 脉冲事件分类
+    ax2.set_title('Spike Event Analysis (TP, FP, FN)')
+    ax2.vlines(tp, ymin=0, ymax=1, color='green', alpha=0.7, label=f'TP ({len(tp)})')
+    ax2.vlines(fp, ymin=0, ymax=1, color='red', alpha=0.7, label=f'FP ({len(fp)})')
+    ax2.vlines(fn, ymin=0, ymax=1, color='orange', alpha=0.7, label=f'FN ({len(fn)})')
+    ax2.set_xlabel('Time Step')
+    ax2.set_yticks([])  # 隐藏y轴刻度
+    ax2.legend()
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    # 保存图像
+    plt.savefig(output_path)
+    plt.close(fig)
+    logging.info(f"Test result visualization saved to {output_path}")
 
 
 # --- 6. 训练函数 ---
@@ -204,7 +269,19 @@ def train_one_epoch(model, loader, optimizer, criterion_mse, criterion_bce, devi
 # --- 7. 主函数 ---
 def main(args):
     # 创建输出目录和日志
-    run_dir = os.path.join(args.output_dir, f"{args.model}_{args.dataset_name}_{time.strftime('%Y%m%d-%H%M%S')}")
+    # 创建一个唯一的、信息丰富的运行ID
+    timestamp = time.strftime('%Y%m%d-%H%M%S')
+    run_id = f"{args.model}_{args.dataset_name}_{timestamp}"
+
+    # 根据模型类型，添加关键的超参数到ID中
+    if args.model == 'tcn':
+        run_id += f"_lr{args.lr}_h{args.hidden_channels}_l{args.num_levels}_k{args.input_kernel_size}"
+    elif args.model == 's4d':
+        run_id += f"_lr{args.lr}_d{args.d_model}_l{args.n_layers}"
+
+    run_id += f"_fusion-{args.fusion_mode}"
+
+    run_dir = os.path.join(args.output_dir, run_id)
     os.makedirs(run_dir, exist_ok=True)
     setup_logging(os.path.join(run_dir, 'run.log'))
 
@@ -228,13 +305,14 @@ def main(args):
             num_hidden_channels=[args.hidden_channels] * args.num_levels,
             input_kernel_size=args.input_kernel_size,
             tcn_kernel_size=args.tcn_kernel_size,
-            dropout=args.dropout
+            dropout=args.dropout,
+            fusion_mode=args.fusion_mode
         ).to(device)
     elif args.model == 's4d':
         model = S4DModel(
             input_channels=20, output_channels=7,
             d_model=args.d_model, n_layers=args.n_layers,
-            d_state=args.d_state, l_max=args.seq_len, dropout=args.dropout
+            d_state=args.d_state, l_max=args.seq_len, dropout=args.dropout, fusion_mode=args.fusion_mode
         ).to(device)
 
     logging.info(f"Model: {args.model}")
@@ -253,7 +331,9 @@ def main(args):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
     # 训练循环
-    best_val_metric = -float('inf')  # 使用F1作为主要指标
+    # 1. 初始化两个最佳指标，而不是一个
+    best_val_ve = -float('inf')
+    best_val_f1 = -float('inf')
     patience_counter = 0
 
     for epoch in range(1, args.epochs + 1):
@@ -266,13 +346,26 @@ def main(args):
                      f"Val VE: {val_metrics['voltage_ve']:.4f} | Val F1: {val_metrics['spike_f1']:.4f} | "
                      f"LR: {scheduler.get_last_lr()[0]:.6f}")
 
-        if val_metrics['spike_f1'] > best_val_metric:
-            best_val_metric = val_metrics['spike_f1']
+        # 2. 检查任一指标是否有所改善
+        ve_improved = val_metrics['voltage_ve'] > best_val_ve
+        f1_improved = val_metrics['spike_f1'] > best_val_f1
+
+        if ve_improved or f1_improved:
+            improvement_message = []
+            if ve_improved:
+                best_val_ve = val_metrics['voltage_ve']
+                improvement_message.append(f"VE to {best_val_ve:.4f}")
+            if f1_improved:
+                best_val_f1 = val_metrics['spike_f1']
+                improvement_message.append(f"F1 to {best_val_f1:.4f}")
+
+            # 只要有任何改善，就重置计数器并保存模型
             patience_counter = 0
             torch.save(model.state_dict(), os.path.join(run_dir, 'best_model.pth'))
-            logging.info("Validation metric improved, saving best model.")
+            logging.info(f"Validation metric improved ({', '.join(improvement_message)}). Saving best model.")
         else:
             patience_counter += 1
+            logging.info(f"No improvement in VE or F1. Patience: {patience_counter}/{args.patience}")
 
         if patience_counter >= args.patience:
             logging.info("Early stopping triggered.")
@@ -280,9 +373,41 @@ def main(args):
 
     # 最终测试
     logging.info("Loading best model for final testing...")
+
+    # --- ★★★ 关键修正: 在加载前重新实例化模型 ★★★
+    # 这确保了模型的架构与保存的权重文件完全匹配，无论之前的循环中发生了什么。
+    if args.model == 'tcn':
+        model = TCNModel(
+            input_channels=20, output_channels=7,
+            num_hidden_channels=[args.hidden_channels] * args.num_levels,
+            input_kernel_size=args.input_kernel_size,
+            tcn_kernel_size=args.tcn_kernel_size,
+            dropout=args.dropout,
+            fusion_mode=args.fusion_mode
+        ).to(device)
+    elif args.model == 's4d':
+        model = S4DModel(
+            input_channels=20, output_channels=7,
+            d_model=args.d_model, n_layers=args.n_layers,
+            d_state=args.d_state, l_max=args.seq_len, dropout=args.dropout, fusion_mode=args.fusion_mode
+        ).to(device)
+
     model.load_state_dict(torch.load(os.path.join(run_dir, 'best_model.pth')))
-    test_metrics = evaluate(model, test_dataset, device, args.seq_len, args.overlap_size)
+
+    # +++ 修改部分 +++
+    # 调用evaluate时，请求返回预测结果
+    test_metrics, test_preds, test_targets = evaluate(
+        model, test_dataset, device, args.seq_len, args.overlap_size, return_predictions=True
+    )
     logging.info(f"Final Test Metrics: {test_metrics}")
+
+    # 调用新的可视化函数
+    plot_test_results(
+        predictions=test_preds,
+        targets=test_targets,
+        output_path=os.path.join(run_dir, 'final_test_visualization.png')
+    )
+    # +++ 修改结束 +++
 
     # 保存结果
     with open(os.path.join(run_dir, 'results.json'), 'w') as f:
@@ -295,7 +420,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train TCN or S4D models on neuron data.")
     # 通用参数
     parser.add_argument('--model', type=str, required=True, choices=['tcn', 's4d'], help='Model to train.')
-    parser.add_argument('--dataset_name', type=str, required=True, choices=['small', 'small_3x', 'small_30x'],
+    parser.add_argument('--dataset_name', type=str, required=True, choices=['small', 'small_3x', 'small_30x', 'simple', 'lif'],
                         help='Dataset to use.')
     parser.add_argument('--data_dir', type=str, default='~/Data/neuron_data', help='Directory containing neuron data.')
     parser.add_argument('--output_dir', type=str, default='./outputs', help='Directory to save results.')
@@ -306,11 +431,13 @@ if __name__ == '__main__':
     parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate.')
     parser.add_argument('--overlap_size', type=int, default=256,
                         help='Overlap size for autoregressive generation window.')
+    parser.add_argument('--fusion_mode', type=str, default='add', choices=['add', 'ablate'],
+                        help="How to fuse initial state. 'add': add to stimulus features, 'ablate': ignore initial state.")
 
     # 根据模型动态设置batch size和seq_len
     temp_args, _ = parser.parse_known_args()
     if temp_args.model == 'tcn':
-        parser.add_argument('--batch_size', type=int, default=4096, help='Batch size for TCN.')
+        parser.add_argument('--batch_size', type=int, default=1024, help='Batch size for TCN.')
         parser.add_argument('--seq_len', type=int, default=1024, help='Sequence length for TCN.')
         # TCN专属参数
         parser.add_argument('--hidden_channels', type=int, default=48)
