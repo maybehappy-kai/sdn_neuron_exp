@@ -21,19 +21,22 @@ SEARCH_SPACE: List[Dict[str, Any]] = [
         'model': 'tcn',
         'params': {
             'lr': [1e-3, 5e-4],
-            'hidden_channels': [48, 64],
-            'num_levels': [4, 6],
-            'dropout': [0.2]
+            'hidden_channels': [32, 48, 64],
+            'num_levels': [4, 6, 8, 10],
+            'dropout': [0.2],
+            'input_kernel_size': [7, 15, 31],
+            'weight_decay': [1e-4, 1e-3, 1e-2]
         }
     },
     {
         'model': 's4d',
         'params': {
             'lr': [2e-3, 1e-3],
-            'd_model': [128, 256],
-            'n_layers': [4, 6],
+            'd_model': [64, 128, 256],
+            'n_layers': [2, 4, 6],
             'd_state': [64],
-            'dropout': [0.1]
+            'dropout': [0.1],
+            'weight_decay': [1e-4, 1e-3, 1e-2]
         }
     }
 ]

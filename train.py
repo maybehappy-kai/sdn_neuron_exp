@@ -190,7 +190,7 @@ def train_one_epoch(model, loader, optimizer, criterion_mse, criterion_bce, devi
 
         loss_mse = criterion_mse(predictions[:, :6, :], v1_target[:, :6, :])
         loss_bce = criterion_bce(predictions[:, 6, :].unsqueeze(1), v1_target[:, 6, :].unsqueeze(1))
-        loss = loss_mse + loss_bce
+        loss = args.voltage_weight * loss_mse + args.spike_weight * loss_bce
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -317,6 +317,9 @@ if __name__ == '__main__':
         parser.add_argument('--num_levels', type=int, default=4)
         parser.add_argument('--input_kernel_size', type=int, default=15)
         parser.add_argument('--tcn_kernel_size', type=int, default=5)
+        parser.add_argument('--voltage_weight', type=float, default=4.0,
+                            help='Weight for voltage MSE loss (default for TCN).')
+        parser.add_argument('--spike_weight', type=float, default=1.0, help='Weight for spike BCE loss.')
     elif temp_args.model == 's4d':
         parser.add_argument('--batch_size', type=int, default=64, help='Batch size for S4D.')
         parser.add_argument('--seq_len', type=int, default=4096, help='Sequence length for S4D.')
@@ -324,6 +327,9 @@ if __name__ == '__main__':
         parser.add_argument('--d_model', type=int, default=128)
         parser.add_argument('--n_layers', type=int, default=4)
         parser.add_argument('--d_state', type=int, default=64)
+        parser.add_argument('--voltage_weight', type=float, default=0.15,
+                            help='Weight for voltage MSE loss (default for S4D).')
+        parser.add_argument('--spike_weight', type=float, default=1.0, help='Weight for spike BCE loss.')
 
     args = parser.parse_args()
     main(args)
