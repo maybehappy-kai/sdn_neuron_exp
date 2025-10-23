@@ -3,7 +3,7 @@
 # ===================================================================
 
 # 忽略所有由 train.py 生成的输出文件（模型、日志、结果）
-outputs/
+*outputs*/
 
 # 忽略你的 Python 虚拟环境文件夹 (请根据你的实际名称修改)
 tslib_env/
@@ -59,3 +59,16 @@ dist/
 # ===================================================================
 .DS_Store
 Thumbs.db
+
+
+# 项目特定脚本
+analyze_data.py
+dataset_visualizations/
+dataset_visualizations_detailed/
+analyze_new_datasets.py
+analyze_results.py
+transform_new_data.py
+transform_raw_data.py
+compress_data.py
+v1_visualizations/
+create_toy_datasets.py
