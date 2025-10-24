@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from typing import List
+import torch.nn.functional as F
+
 
 
 class S4D(nn.Module):
@@ -148,10 +150,14 @@ class S4Block(nn.Module):
 class S4DModel(nn.Module):
     """ 最终的S4D模型 """
 
-    def __init__(self, input_channels, output_channels, d_model, n_layers, d_state=64, l_max=1024, dropout=0.1, fusion_mode: str = 'add'):
-        super().__init__()
+    def __init__(self, input_channels, output_channels, d_model, n_layers, d_state=64, l_max=1024, dropout=0.1,
+                 fusion_mode: str = 'add',
+                 use_voltage_filter: bool = False):
+        super(S4DModel, self).__init__()
         self.d_model = d_model
         self.fusion_mode = fusion_mode
+        self.use_voltage_filter = use_voltage_filter  # <-- 保存参数
+        self.output_channels = output_channels  # <-- 保存通道数
 
         self.input_proj = nn.Linear(input_channels, d_model)
         self.state_conditioner = nn.Linear(output_channels, d_model)
@@ -162,7 +168,15 @@ class S4DModel(nn.Module):
 
         self.output_proj = nn.Linear(d_model, output_channels)
 
-    def forward(self, stimulus_seq, initial_state):
+        if self.use_voltage_filter:
+            self.voltage_to_spike_filter = nn.Sequential(
+                # --- ↓↓↓ 将 in_channels 从 1 修改为 2 ↓↓↓ ---
+                nn.Conv1d(in_channels=2, out_channels=8, kernel_size=256, padding='same', bias=False),
+                nn.ReLU(),
+                nn.Conv1d(in_channels=8, out_channels=1, kernel_size=1)
+            )
+
+    def forward(self, stimulus_seq, initial_state, target_v1: torch.Tensor = None):
         """ 并行模式 (用于训练) """
         # B, C, L -> B, L, C
         stimulus_seq = stimulus_seq.transpose(-1, -2)
@@ -184,10 +198,46 @@ class S4DModel(nn.Module):
             x = block(x)
 
         # 3. 输出投影
-        prediction = self.output_proj(x)
+        prediction_transposed = self.output_proj(x)
+        base_prediction = prediction_transposed.transpose(-1, -2)
 
-        # B, L, C -> B, C, L
-        return prediction.transpose(-1, -2)
+        if self.use_voltage_filter:
+            num_voltage_channels = self.output_channels - 1
+            soma_voltage_idx = num_voltage_channels - 1
+            spike_channel_idx = self.output_channels - 1
+
+            pred_voltage_part = base_prediction[:, :num_voltage_channels, :]
+            pred_spike_logits = base_prediction[:, spike_channel_idx, :].unsqueeze(1)
+            # --- ↓↓↓ 核心修改：准备电压本身和其导数作为双通道输入 ↓↓↓ ---
+            pred_soma_voltage = pred_voltage_part[:, soma_voltage_idx, :]
+
+            # 计算电压差分（近似导数）
+            pred_derivative = torch.diff(pred_soma_voltage, n=1, dim=-1)
+            pred_derivative = F.pad(pred_derivative, (1, 0), "constant", 0)
+
+            # 将电压和导数拼接成一个 (B, 2, L) 的张量
+            input_voltage_for_filter = torch.stack([pred_soma_voltage, pred_derivative], dim=1)
+
+            # 如果是训练且提供了目标，则使用混合信号
+            if self.training and target_v1 is not None:
+                true_soma_voltage = target_v1[:, soma_voltage_idx, :]
+                true_derivative = torch.diff(true_soma_voltage, n=1, dim=-1)
+                true_derivative = F.pad(true_derivative, (1, 0), "constant", 0)
+
+                # 分别混合电压和导数
+                mixed_soma_voltage = (pred_soma_voltage + true_soma_voltage) / 2.0
+                mixed_derivative = (pred_derivative + true_derivative) / 2.0
+
+                # 拼接成双通道
+                input_voltage_for_filter = torch.stack([mixed_soma_voltage, mixed_derivative], dim=1)
+
+            # 通过可学习的卷积核 (注意输入不再需要 .unsqueeze(1))
+            filter_effect = self.voltage_to_spike_filter(input_voltage_for_filter)
+
+            final_spike_logits = pred_spike_logits + filter_effect
+            return torch.cat([pred_voltage_part, final_spike_logits], dim=1)
+        else:
+            return base_prediction
 
     @torch.no_grad()
     def generate(self, stimulus_seq, initial_state):

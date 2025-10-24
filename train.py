@@ -1,6 +1,7 @@
 # ~/sdn_neuron_exp/train.py
 
 import os
+import glob
 import argparse
 import logging
 import json
@@ -59,8 +60,24 @@ def get_datasets(data_dir, dataset_name, seq_len):
     v0_path = os.path.join(data_dir, f"v0_{dataset_name}.npy")
     v1_path = os.path.join(data_dir, f"v1_{dataset_name}.npy")
 
-    v0_full = np.load(v0_path)[0]  # 去掉批次维度
-    v1_full = np.load(v1_path)[0]
+    v0_full_raw = np.load(v0_path)
+    v1_full_raw = np.load(v1_path)
+
+    # --- 新增: 格式校验与维度捕获 ---
+    if v0_full_raw.ndim != 3 or v0_full_raw.shape[0] != 1:
+        raise ValueError(f"错误: v0 文件 '{os.path.basename(v0_path)}' 的形状应为 (1, m, T)，实际为 {v0_full_raw.shape}")
+    if v1_full_raw.ndim != 3 or v1_full_raw.shape[0] != 1:
+        raise ValueError(
+            f"错误: v1 文件 '{os.path.basename(v1_path)}' 的形状应为 (1, n, T+1)，实际为 {v1_full_raw.shape}")
+
+    # 去掉批次维度以匹配后续代码
+    v0_full = v0_full_raw[0]
+    v1_full = v1_full_raw[0]
+
+    input_channels = v0_full.shape[0]
+    output_channels = v1_full.shape[0]
+    logging.info(f"自动检测到 -> 输入通道数: {input_channels}, 输出通道数: {output_channels}")
+    # --- 修改结束 ---
 
     total_timesteps = v0_full.shape[1]
 
@@ -79,18 +96,19 @@ def get_datasets(data_dir, dataset_name, seq_len):
 
     logging.info(
         f"Datasets created. Train: {len(train_dataset.v0[0])}, Val: {len(val_dataset.v0[0])}, Test: {len(test_dataset.v0[0])} timesteps.")
-    return train_dataset, val_dataset, test_dataset
+    return train_dataset, val_dataset, test_dataset, input_channels, output_channels
 
 
 # --- 4. 性能指标计算 ---
-def calculate_metrics(predictions, targets):
+def calculate_metrics(predictions, targets, output_channels):
     metrics = {}
 
-    # 分离电压和脉冲
-    pred_voltage = predictions[:, :6, :]
-    pred_spike_logits = predictions[:, 6, :]
-    target_voltage = targets[:, :6, :]
-    target_spike = targets[:, 6, :]
+    # 分离电压和脉冲 (动态地)
+    num_voltage_channels = output_channels - 1
+    pred_voltage = predictions[:, :num_voltage_channels, :]
+    pred_spike_logits = predictions[:, num_voltage_channels, :]
+    target_voltage = targets[:, :num_voltage_channels, :]
+    target_spike = targets[:, num_voltage_channels, :]
 
     # 方差解释率 (VE)
     ss_res = torch.sum((target_voltage - pred_voltage) ** 2)
@@ -117,8 +135,10 @@ def calculate_metrics(predictions, targets):
 # --- 5. 评估函数 (自回归生成) ---
 # [最终修正版 v3 - 简洁正确]
 @torch.no_grad()
-def evaluate(model, dataset, device, seq_len, overlap_size, return_predictions=False):
+def evaluate(model, dataset, device, seq_len, overlap_size, output_channels, return_predictions=False):
     model.eval()
+
+    num_voltage_channels = output_channels - 1  # <--- 在函数开头定义
 
     if overlap_size >= seq_len:
         raise ValueError("overlap_size must be smaller than seq_len.")
@@ -136,7 +156,7 @@ def evaluate(model, dataset, device, seq_len, overlap_size, return_predictions=F
     v0_chunk_first = full_v0[:, :, :seq_len]
     predicted_chunk_first = model(v0_chunk_first, current_state)
     # ★ 在这里加入钳制 ★
-    predicted_chunk_first[:, :6, :] = torch.clamp(predicted_chunk_first[:, :6, :], 0.0, 1.0)
+    predicted_chunk_first[:, :num_voltage_channels, :] = torch.clamp(predicted_chunk_first[:, :num_voltage_channels, :], 0.0, 1.0)
     all_predictions.append(predicted_chunk_first)
 
     start_pos = stride
@@ -148,7 +168,7 @@ def evaluate(model, dataset, device, seq_len, overlap_size, return_predictions=F
         v0_chunk = full_v0[:, :, start_pos: start_pos + seq_len]
         predicted_chunk = model(v0_chunk, current_state)
         # ★ 在这里加入钳制 ★
-        predicted_chunk[:, :6, :] = torch.clamp(predicted_chunk[:, :6, :], 0.0, 1.0)
+        predicted_chunk[:, :num_voltage_channels, :] = torch.clamp(predicted_chunk[:, :num_voltage_channels, :], 0.0, 1.0)
 
         new_prediction_part = predicted_chunk[:, :, -stride:]
         all_predictions.append(new_prediction_part)
@@ -167,7 +187,7 @@ def evaluate(model, dataset, device, seq_len, overlap_size, return_predictions=F
 
         predicted_chunk_last = model(v0_chunk_last, current_state)
         # ★ 在这里加入钳制 ★
-        predicted_chunk_last[:, :6, :] = torch.clamp(predicted_chunk_last[:, :6, :], 0.0, 1.0)
+        predicted_chunk_last[:, :num_voltage_channels, :] = torch.clamp(predicted_chunk_last[:, :num_voltage_channels, :], 0.0, 1.0)
 
         # [修正后]
         all_predictions.append(predicted_chunk_last[:, :, overlap_size:last_chunk_len])
@@ -176,7 +196,7 @@ def evaluate(model, dataset, device, seq_len, overlap_size, return_predictions=F
     final_prediction = torch.cat(all_predictions, dim=2)
     final_target = full_v1_target[:, :, 1:final_prediction.shape[2] + 1]
 
-    metrics = calculate_metrics(final_prediction, final_target)
+    metrics = calculate_metrics(final_prediction, final_target, output_channels)  # <--- 传递参数
 
     if return_predictions:
         return metrics, final_prediction, final_target  # <--- 如果标志为True，返回三个值
@@ -184,7 +204,7 @@ def evaluate(model, dataset, device, seq_len, overlap_size, return_predictions=F
         return metrics  # <--- 否则，保持原样
 
 
-def plot_test_results(predictions, targets, output_path):
+def plot_test_results(predictions, targets, output_path, output_channels):
     """
     在测试集上生成并保存可视化对比图。
 
@@ -197,16 +217,19 @@ def plot_test_results(predictions, targets, output_path):
     preds_np = predictions.squeeze(0).cpu().numpy()
     targets_np = targets.squeeze(0).cpu().numpy()
 
-    # --- 1. 提取胞体电位 (Soma Voltage) 数据 (倒数第二个通道，索引为5) ---
-    soma_pred = preds_np[5, :]
-    soma_true = targets_np[5, :]
+    num_voltage_channels = output_channels - 1
+    soma_channel_index = num_voltage_channels - 1
+
+    # --- 1. 提取最后一个电压通道 (通常是胞体电位) ---
+    soma_pred = preds_np[num_voltage_channels - 1, :]
+    soma_true = targets_np[num_voltage_channels - 1, :]
     timesteps = np.arange(len(soma_true))
 
-    # --- 2. 提取和处理脉冲数据 (最后一个通道，索引为6) ---
-    spike_logits_pred = preds_np[6, :]
+    # --- 2. 提取脉冲数据 (最后一个通道) ---
+    spike_logits_pred = preds_np[num_voltage_channels, :]
     spike_prob_pred = 1 / (1 + np.exp(-spike_logits_pred))  # Sigmoid激活
     spike_binary_pred = (spike_prob_pred > 0.5).astype(int)
-    spike_true = targets_np[6, :].astype(int)
+    spike_true = targets_np[num_voltage_channels, :].astype(int)
 
     # --- 3. 计算 TP, FP, FN ---
     tp = np.where((spike_binary_pred == 1) & (spike_true == 1))[0]
@@ -221,7 +244,7 @@ def plot_test_results(predictions, targets, output_path):
     # 子图1: 胞体电位对比
     ax1.plot(timesteps, soma_true, label='Ground Truth Voltage', color='royalblue', linewidth=2)
     ax1.plot(timesteps, soma_pred, label='Predicted Voltage', color='darkorange', linestyle='--', linewidth=1.5)
-    ax1.set_title('Soma Membrane Potential (Channel 5)')
+    ax1.set_title(f'Soma Membrane Potential (Channel {soma_channel_index})')  # <--- 修改这里
     ax1.set_ylabel('Membrane Potential (mV)')
     ax1.legend()
     ax1.grid(True, linestyle=':', alpha=0.6)
@@ -244,17 +267,18 @@ def plot_test_results(predictions, targets, output_path):
 
 
 # --- 6. 训练函数 ---
-def train_one_epoch(model, loader, optimizer, criterion_mse, criterion_bce, device):
+def train_one_epoch(model, loader, optimizer, criterion_mse, criterion_bce, device, output_channels):
     model.train()
     total_loss = 0
+    num_voltage_channels = output_channels - 1 # <--- 在循环外定义一次即可
     for v0_chunk, v1_context, v1_target in loader:
         v0_chunk, v1_context, v1_target = v0_chunk.to(device), v1_context.to(device), v1_target.to(device)
 
         optimizer.zero_grad()
-        predictions = model(v0_chunk, v1_context)
+        predictions = model(v0_chunk, v1_context, v1_target)
 
-        loss_mse = criterion_mse(predictions[:, :6, :], v1_target[:, :6, :])
-        loss_bce = criterion_bce(predictions[:, 6, :].unsqueeze(1), v1_target[:, 6, :].unsqueeze(1))
+        loss_mse = criterion_mse(predictions[:, :num_voltage_channels, :], v1_target[:, :num_voltage_channels, :])
+        loss_bce = criterion_bce(predictions[:, num_voltage_channels, :].unsqueeze(1), v1_target[:, num_voltage_channels, :].unsqueeze(1))
         loss = args.voltage_weight * loss_mse + args.spike_weight * loss_bce
 
         loss.backward()
@@ -281,6 +305,16 @@ def main(args):
 
     run_id += f"_fusion-{args.fusion_mode}"
 
+    run_id += f"_sw{args.spike_weight}"
+
+    # --- ↓↓↓ 在此处添加新代码 ↓↓↓ ---
+    # 将是否使用电压滤波器（voltage filter）的信息加入命名
+    if args.use_voltage_filter:
+        run_id += "_vf-on"
+    else:
+        run_id += "_vf-off"
+    # --- ↑↑↑ 修改结束 ↑↑↑ ---
+
     run_dir = os.path.join(args.output_dir, run_id)
     os.makedirs(run_dir, exist_ok=True)
     setup_logging(os.path.join(run_dir, 'run.log'))
@@ -294,32 +328,35 @@ def main(args):
     np.random.seed(42)
 
     # 加载数据
-    train_dataset, val_dataset, test_dataset = get_datasets(os.path.expanduser(args.data_dir), args.dataset_name,
-                                                            args.seq_len)
+    train_dataset, val_dataset, test_dataset, input_channels, output_channels = get_datasets(
+        os.path.expanduser(args.data_dir), args.dataset_name, args.seq_len)  # <--- 捕获通道数
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
 
     # 实例化模型
     if args.model == 'tcn':
         model = TCNModel(
-            input_channels=20, output_channels=7,
+            input_channels=input_channels, output_channels=output_channels,  # <--- 使用动态通道数
             num_hidden_channels=[args.hidden_channels] * args.num_levels,
             input_kernel_size=args.input_kernel_size,
             tcn_kernel_size=args.tcn_kernel_size,
             dropout=args.dropout,
-            fusion_mode=args.fusion_mode
+            fusion_mode=args.fusion_mode,
+            use_voltage_filter=args.use_voltage_filter
         ).to(device)
     elif args.model == 's4d':
         model = S4DModel(
-            input_channels=20, output_channels=7,
+            input_channels=input_channels, output_channels=output_channels,  # <--- 使用动态通道数
             d_model=args.d_model, n_layers=args.n_layers,
-            d_state=args.d_state, l_max=args.seq_len, dropout=args.dropout, fusion_mode=args.fusion_mode
+            d_state=args.d_state, l_max=args.seq_len, dropout=args.dropout, fusion_mode=args.fusion_mode, use_voltage_filter=args.use_voltage_filter
         ).to(device)
 
     logging.info(f"Model: {args.model}")
     logging.info(f"Total parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 
     # 损失函数和优化器
-    spikes = train_dataset.v1[6, :]
+    # 损失函数和优化器
+    spike_channel_index = output_channels - 1
+    spikes = train_dataset.v1[spike_channel_index, :]
     pos_weight_val = (len(spikes) - spikes.sum()) / spikes.sum() if spikes.sum() > 0 else 1.0
     pos_weight = torch.tensor([pos_weight_val], device=device)
 
@@ -337,8 +374,9 @@ def main(args):
     patience_counter = 0
 
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion_mse, criterion_bce, device)
-        val_metrics = evaluate(model, val_dataset, device, args.seq_len, args.overlap_size)
+        train_loss = train_one_epoch(model, train_loader, optimizer, criterion_mse, criterion_bce, device,
+                                     output_channels)  # <--- 传递
+        val_metrics = evaluate(model, val_dataset, device, args.seq_len, args.overlap_size, output_channels)  # <--- 传递
 
         scheduler.step()
 
@@ -346,26 +384,36 @@ def main(args):
                      f"Val VE: {val_metrics['voltage_ve']:.4f} | Val F1: {val_metrics['spike_f1']:.4f} | "
                      f"LR: {scheduler.get_last_lr()[0]:.6f}")
 
-        # 2. 检查任一指标是否有所改善
-        ve_improved = val_metrics['voltage_ve'] > best_val_ve
-        f1_improved = val_metrics['spike_f1'] > best_val_f1
+        # 2. 检查模型是否满足新的保存条件：一方提升，另一方下降不超过其最佳值的10%
+        current_ve = val_metrics['voltage_ve']
+        current_f1 = val_metrics['spike_f1']
 
-        if ve_improved or f1_improved:
+        # 定义可接受的退化阈值（10% of the absolute best value）
+        # 即使best_val_ve为负，此计算也有效
+        ve_degradation_threshold = best_val_ve - abs(best_val_ve) * 0.1
+        f1_degradation_threshold = best_val_f1 - abs(best_val_f1) * 0.1  # F1>=0, abs是安全的
+
+        # 检查两个主要条件
+        ve_improves_while_f1_is_ok = (current_ve > best_val_ve) and (current_f1 >= f1_degradation_threshold)
+        f1_improves_while_ve_is_ok = (current_f1 > best_val_f1) and (current_ve >= ve_degradation_threshold)
+
+        if ve_improves_while_f1_is_ok or f1_improves_while_ve_is_ok:
             improvement_message = []
-            if ve_improved:
-                best_val_ve = val_metrics['voltage_ve']
+            # 分别更新各自的最佳值
+            if current_ve > best_val_ve:
+                best_val_ve = current_ve
                 improvement_message.append(f"VE to {best_val_ve:.4f}")
-            if f1_improved:
-                best_val_f1 = val_metrics['spike_f1']
+            if current_f1 > best_val_f1:
+                best_val_f1 = current_f1
                 improvement_message.append(f"F1 to {best_val_f1:.4f}")
 
-            # 只要有任何改善，就重置计数器并保存模型
+            # 重置耐心计数器并保存模型
             patience_counter = 0
             torch.save(model.state_dict(), os.path.join(run_dir, 'best_model.pth'))
-            logging.info(f"Validation metric improved ({', '.join(improvement_message)}). Saving best model.")
+            logging.info(f"New best model found ({', '.join(improvement_message)}). Saving model.")
         else:
             patience_counter += 1
-            logging.info(f"No improvement in VE or F1. Patience: {patience_counter}/{args.patience}")
+            logging.info(f"No improvement based on criteria. Patience: {patience_counter}/{args.patience}")
 
         if patience_counter >= args.patience:
             logging.info("Early stopping triggered.")
@@ -378,18 +426,19 @@ def main(args):
     # 这确保了模型的架构与保存的权重文件完全匹配，无论之前的循环中发生了什么。
     if args.model == 'tcn':
         model = TCNModel(
-            input_channels=20, output_channels=7,
+            input_channels=input_channels, output_channels=output_channels, # <--- 修改这里
             num_hidden_channels=[args.hidden_channels] * args.num_levels,
             input_kernel_size=args.input_kernel_size,
             tcn_kernel_size=args.tcn_kernel_size,
             dropout=args.dropout,
-            fusion_mode=args.fusion_mode
+            fusion_mode=args.fusion_mode,
+            use_voltage_filter = args.use_voltage_filter
         ).to(device)
     elif args.model == 's4d':
         model = S4DModel(
-            input_channels=20, output_channels=7,
+            input_channels=input_channels, output_channels=output_channels, # <--- 修改这里
             d_model=args.d_model, n_layers=args.n_layers,
-            d_state=args.d_state, l_max=args.seq_len, dropout=args.dropout, fusion_mode=args.fusion_mode
+            d_state=args.d_state, l_max=args.seq_len, dropout=args.dropout, fusion_mode=args.fusion_mode, use_voltage_filter=args.use_voltage_filter
         ).to(device)
 
     model.load_state_dict(torch.load(os.path.join(run_dir, 'best_model.pth')))
@@ -397,7 +446,8 @@ def main(args):
     # +++ 修改部分 +++
     # 调用evaluate时，请求返回预测结果
     test_metrics, test_preds, test_targets = evaluate(
-        model, test_dataset, device, args.seq_len, args.overlap_size, return_predictions=True
+        model, test_dataset, device, args.seq_len, args.overlap_size, output_channels, return_predictions=True
+        # <--- 传递
     )
     logging.info(f"Final Test Metrics: {test_metrics}")
 
@@ -405,7 +455,8 @@ def main(args):
     plot_test_results(
         predictions=test_preds,
         targets=test_targets,
-        output_path=os.path.join(run_dir, 'final_test_visualization.png')
+        output_path=os.path.join(run_dir, 'final_test_visualization.png'),
+        output_channels=output_channels
     )
     # +++ 修改结束 +++
 
@@ -417,13 +468,39 @@ def main(args):
 
 
 if __name__ == '__main__':
+    # --- 新增: 动态扫描数据集 ---
+
+    # 临时的 argparse 用来获取 data_dir，以便我们知道去哪里扫描
+    temp_parser = argparse.ArgumentParser(add_help=False)
+    temp_parser.add_argument('--data_dir', type=str, default='~/Data/neuron_data')
+    temp_args, _ = temp_parser.parse_known_args()
+    expanded_data_dir = os.path.expanduser(temp_args.data_dir)
+
+    # 扫描 v0_{name}.npy 文件并提取 name
+    available_datasets = []
+    if os.path.isdir(expanded_data_dir):
+        v0_files = glob.glob(os.path.join(expanded_data_dir, 'v0_*.npy'))
+        for f in v0_files:
+            basename = os.path.basename(f)
+            # 从 "v0_" 和 ".npy" 之间提取数据集名称
+            dataset_name = basename[3:-4]
+            available_datasets.append(dataset_name)
+
+    if not available_datasets:
+        # 如果找不到任何数据集，就允许任意字符串，后续让文件加载逻辑去报错
+        print(f"警告: 在 '{expanded_data_dir}' 中未找到任何数据集 (v0_*.npy)，将不限制 --dataset_name 参数。")
+        dataset_choices = None
+    else:
+        dataset_choices = sorted(available_datasets)
+        print(f"自动发现可用数据集: {dataset_choices}")
+    # --- 修改结束 ---
     parser = argparse.ArgumentParser(description="Train TCN or S4D models on neuron data.")
     # 通用参数
     parser.add_argument('--model', type=str, required=True, choices=['tcn', 's4d'], help='Model to train.')
-    parser.add_argument('--dataset_name', type=str, required=True, choices=['small', 'small_3x', 'small_30x', 'simple', 'lif'],
-                        help='Dataset to use.')
+    parser.add_argument('--dataset_name', type=str, required=True, choices=dataset_choices,
+                        help=f'Dataset to use. Discovered options: {dataset_choices}')  # <--- 使用动态列表
     parser.add_argument('--data_dir', type=str, default='~/Data/neuron_data', help='Directory containing neuron data.')
-    parser.add_argument('--output_dir', type=str, default='./outputs', help='Directory to save results.')
+    parser.add_argument('--output_dir', type=str, default='./outputs_new', help='Directory to save results.')
     parser.add_argument('--epochs', type=int, default=100, help='Max number of epochs.')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate.')
     parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay.')
@@ -433,6 +510,8 @@ if __name__ == '__main__':
                         help='Overlap size for autoregressive generation window.')
     parser.add_argument('--fusion_mode', type=str, default='add', choices=['add', 'ablate'],
                         help="How to fuse initial state. 'add': add to stimulus features, 'ablate': ignore initial state.")
+    parser.add_argument('--use_voltage_filter', type=lambda x: (str(x).lower() == 'true'), default=False,
+                        help="Enable the biexponential filter from voltage to spike logits (e.g., --use_voltage_filter True).")
 
     # 根据模型动态设置batch size和seq_len
     temp_args, _ = parser.parse_known_args()
@@ -444,7 +523,7 @@ if __name__ == '__main__':
         parser.add_argument('--num_levels', type=int, default=4)
         parser.add_argument('--input_kernel_size', type=int, default=15)
         parser.add_argument('--tcn_kernel_size', type=int, default=5)
-        parser.add_argument('--voltage_weight', type=float, default=4.0,
+        parser.add_argument('--voltage_weight', type=float, default=1.0,
                             help='Weight for voltage MSE loss (default for TCN).')
         parser.add_argument('--spike_weight', type=float, default=1.0, help='Weight for spike BCE loss.')
     elif temp_args.model == 's4d':
@@ -454,7 +533,7 @@ if __name__ == '__main__':
         parser.add_argument('--d_model', type=int, default=128)
         parser.add_argument('--n_layers', type=int, default=4)
         parser.add_argument('--d_state', type=int, default=64)
-        parser.add_argument('--voltage_weight', type=float, default=0.15,
+        parser.add_argument('--voltage_weight', type=float, default=1.0,
                             help='Weight for voltage MSE loss (default for S4D).')
         parser.add_argument('--spike_weight', type=float, default=1.0, help='Weight for spike BCE loss.')
 

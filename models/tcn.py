@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from torch.nn.utils import weight_norm
 from typing import List
+import torch.nn.functional as F
 
 
 class TemporalBlock(nn.Module):
@@ -61,9 +62,12 @@ class TCNModel(nn.Module):
     """
 
     def __init__(self, input_channels: int, output_channels: int, num_hidden_channels: List[int],
-                 input_kernel_size: int, tcn_kernel_size: int, dropout: float = 0.2, fusion_mode: str = 'add'):
+                 input_kernel_size: int, tcn_kernel_size: int, dropout: float = 0.2, fusion_mode: str = 'add',
+                 use_voltage_filter: bool = False):
         super(TCNModel, self).__init__()
         self.fusion_mode = fusion_mode
+        self.use_voltage_filter = use_voltage_filter  # <-- 保存参数
+        self.output_channels = output_channels  # <-- 保存通道数以供后续使用
 
         # --- ★★★ 关键修改 1: 用一个TemporalBlock替换原来的第一层 ★★★ ---
         # 我们现在使用一个完整的、带有残差连接的TemporalBlock作为“事件探测器”。
@@ -95,10 +99,17 @@ class TCNModel(nn.Module):
 
         self.tcn_core = nn.Sequential(*layers)
 
-        # --- 输出层 (不变) ---
         self.output_layer = nn.Conv1d(num_hidden_channels[-1], output_channels, 1)
 
-    def forward(self, stimulus_seq: torch.Tensor, initial_state: torch.Tensor) -> torch.Tensor:
+        if self.use_voltage_filter:
+            self.voltage_to_spike_filter = nn.Sequential(
+                # --- ↓↓↓ 将 in_channels 从 1 修改为 2 ↓↓↓ ---
+                nn.Conv1d(in_channels=2, out_channels=8, kernel_size=256, padding='same', bias=False),
+                nn.ReLU(),
+                nn.Conv1d(in_channels=8, out_channels=1, kernel_size=1)
+            )
+
+    def forward(self, stimulus_seq: torch.Tensor, initial_state: torch.Tensor, target_v1: torch.Tensor = None) -> torch.Tensor:
         """
         模型的前向传播 (已更新)
         """
@@ -118,11 +129,45 @@ class TCNModel(nn.Module):
 
         # 3. 通过TCN核心
         tcn_output = self.tcn_core(fused_features)
+        base_prediction = self.output_layer(tcn_output)
 
-        # 4. 通过输出层得到最终预测
-        prediction = self.output_layer(tcn_output)
+        if self.use_voltage_filter:
+            num_voltage_channels = self.output_channels - 1
+            soma_voltage_idx = num_voltage_channels - 1
+            spike_channel_idx = self.output_channels - 1
 
-        return prediction
+            pred_voltage_part = base_prediction[:, :num_voltage_channels, :]
+            pred_spike_logits = base_prediction[:, spike_channel_idx, :].unsqueeze(1)
+            # --- ↓↓↓ 核心修改：准备电压本身和其导数作为双通道输入 ↓↓↓ ---
+            pred_soma_voltage = pred_voltage_part[:, soma_voltage_idx, :]
+
+            # 计算电压差分（近似导数）
+            pred_derivative = torch.diff(pred_soma_voltage, n=1, dim=-1)
+            pred_derivative = F.pad(pred_derivative, (1, 0), "constant", 0)
+
+            # 将电压和导数拼接成一个 (B, 2, L) 的张量
+            input_voltage_for_filter = torch.stack([pred_soma_voltage, pred_derivative], dim=1)
+
+            # 如果是训练且提供了目标，则使用混合信号
+            if self.training and target_v1 is not None:
+                true_soma_voltage = target_v1[:, soma_voltage_idx, :]
+                true_derivative = torch.diff(true_soma_voltage, n=1, dim=-1)
+                true_derivative = F.pad(true_derivative, (1, 0), "constant", 0)
+
+                # 分别混合电压和导数
+                mixed_soma_voltage = (pred_soma_voltage + true_soma_voltage) / 2.0
+                mixed_derivative = (pred_derivative + true_derivative) / 2.0
+
+                # 拼接成双通道
+                input_voltage_for_filter = torch.stack([mixed_soma_voltage, mixed_derivative], dim=1)
+
+            # 通过可学习的卷积核 (注意输入不再需要 .unsqueeze(1))
+            filter_effect = self.voltage_to_spike_filter(input_voltage_for_filter)
+
+            final_spike_logits = pred_spike_logits + filter_effect
+            return torch.cat([pred_voltage_part, final_spike_logits], dim=1)
+        else:
+            return base_prediction
 
 
 # =============================================================================

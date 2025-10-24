@@ -10,6 +10,7 @@ import os # <--- 1. 确保导入 os 模块
 # --- 从 train.py 复制必要的类和函数 ---
 from train import get_datasets, TCNModel, S4DModel
 
+
 def analyze_loss_magnitudes(args):
     """
     分析并打印在一个 epoch 内电压和脉冲损失的平均量级。
@@ -17,29 +18,30 @@ def analyze_loss_magnitudes(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # --- 2. 在这里进行修改 ---
     expanded_data_dir = os.path.expanduser(args.data_dir)
 
-    # 仅加载训练集，并使用处理过的路径
-    train_dataset, _, _ = get_datasets(
-        data_dir=expanded_data_dir, # <--- 3. 使用新的、已扩展的路径
+    # --- 修改 1: 捕获动态通道数 ---
+    # 注意：现在 get_datasets 返回5个值
+    train_dataset, _, _, input_channels, output_channels = get_datasets(
+        data_dir=expanded_data_dir,
         dataset_name=args.dataset_name,
         seq_len=args.seq_len
     )
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    print(f"检测到输入通道: {input_channels}, 输出通道: {output_channels}")
 
-    # 初始化模型 (以 TCN 为例)
+    # --- 修改 2: 使用动态通道数初始化模型 ---
     if args.model == 'tcn':
         model = TCNModel(
-            input_channels=20, output_channels=7,
+            input_channels=input_channels, output_channels=output_channels,
             num_hidden_channels=[args.hidden_channels] * args.num_levels,
             input_kernel_size=args.input_kernel_size,
             tcn_kernel_size=args.tcn_kernel_size,
             dropout=0.2
         ).to(device)
-    else: # S4D
+    else:  # S4D
         model = S4DModel(
-            input_channels=20, output_channels=7,
+            input_channels=input_channels, output_channels=output_channels,
             d_model=args.d_model, n_layers=args.n_layers,
             d_state=args.d_state, l_max=args.seq_len, dropout=0.2
         ).to(device)
@@ -53,17 +55,23 @@ def analyze_loss_magnitudes(args):
     bce_losses = []
 
     print(f"Analyzing loss magnitudes for one epoch on '{args.dataset_name}' dataset...")
-    with torch.no_grad(): # 无需计算梯度
+
+    # --- 修改 3: 动态计算损失 ---
+    num_voltage_channels = output_channels - 1
+    with torch.no_grad():  # 无需计算梯度
         for v0_chunk, v1_context, v1_target in train_loader:
             v0_chunk, v1_context, v1_target = v0_chunk.to(device), v1_context.to(device), v1_target.to(device)
 
             predictions = model(v0_chunk, v1_context)
 
-            loss_mse = criterion_mse(predictions[:, :6, :], v1_target[:, :6, :])
-            loss_bce = criterion_bce(predictions[:, 6, :].unsqueeze(1), v1_target[:, 6, :].unsqueeze(1))
+            loss_mse = criterion_mse(predictions[:, :num_voltage_channels, :], v1_target[:, :num_voltage_channels, :])
+            loss_bce = criterion_bce(predictions[:, num_voltage_channels, :].unsqueeze(1),
+                                     v1_target[:, num_voltage_channels, :].unsqueeze(1))
 
             mse_losses.append(loss_mse.item())
             bce_losses.append(loss_bce.item())
+
+    # ... (后续打印和计算推荐权重的代码无需修改) ...
 
     avg_mse = np.mean(mse_losses)
     avg_bce = np.mean(bce_losses)
@@ -86,11 +94,43 @@ def analyze_loss_magnitudes(args):
 
 
 if __name__ == '__main__':
+    # --- 新增: 动态扫描数据集 ---
+    import glob
+
+    temp_parser = argparse.ArgumentParser(add_help=False)
+    temp_parser.add_argument('--data_dir', type=str, default='~/Data/neuron_data')
+    temp_args, _ = temp_parser.parse_known_args()
+    expanded_data_dir = os.path.expanduser(temp_args.data_dir)
+
+    available_datasets = []
+    if os.path.isdir(expanded_data_dir):
+        v0_files = glob.glob(os.path.join(expanded_data_dir, 'v0_*.npy'))
+        for f in v0_files:
+            dataset_name = os.path.basename(f)[3:-4]
+            available_datasets.append(dataset_name)
+
+    if not available_datasets:
+        print(f"警告: 在 '{expanded_data_dir}' 中未找到任何数据集，将不限制 --dataset_name 参数。")
+        dataset_choices = None
+    else:
+        dataset_choices = sorted(available_datasets)
+        print(f"自动发现可用数据集: {dataset_choices}")
+    # --- 修改结束 ---
+
     parser = argparse.ArgumentParser(description="Analyze loss magnitudes.")
-    # --- 复制 train.py 中的所有参数 ---
     parser.add_argument('--model', type=str, required=True, choices=['tcn', 's4d'])
-    parser.add_argument('--dataset_name', type=str, required=True, choices=['small', 'small_3x', 'small_30x'])
+    parser.add_argument('--dataset_name', type=str, required=True, choices=dataset_choices,
+                        help=f'Dataset to use. Discovered options: {dataset_choices}')  # <--- 使用动态列表
     parser.add_argument('--data_dir', type=str, default='~/Data/neuron_data')
+    # --- 新增: 添加 train.py 中存在的其他通用参数 ---
+    parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate.')
+    parser.add_argument('--fusion_mode', type=str, default='add', choices=['add', 'ablate'],
+                        help="How to fuse initial state. 'add': add to stimulus features, 'ablate': ignore initial state.")
+    parser.add_argument('--spike_weight', type=float, default=1.0, help='Weight for spike BCE loss.')
+    parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay.')
+    # --- 修改结束 ---
+
+    # ... (后续动态设置模型参数的代码不变) ...
 
     # 根据模型动态设置
     temp_args, _ = parser.parse_known_args()
