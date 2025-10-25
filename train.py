@@ -500,7 +500,7 @@ if __name__ == '__main__':
     parser.add_argument('--dataset_name', type=str, required=True, choices=dataset_choices,
                         help=f'Dataset to use. Discovered options: {dataset_choices}')  # <--- 使用动态列表
     parser.add_argument('--data_dir', type=str, default='~/Data/neuron_data', help='Directory containing neuron data.')
-    parser.add_argument('--output_dir', type=str, default='./outputs_new', help='Directory to save results.')
+    parser.add_argument('--output_dir', type=str, default='./outputs', help='Directory to save results.')
     parser.add_argument('--epochs', type=int, default=100, help='Max number of epochs.')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate.')
     parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay.')

@@ -183,7 +183,6 @@ class S4DModel(nn.Module):
 
         # 1. 输入投影和状态调节
         stim_features = self.input_proj(stimulus_seq)
-        # --- 根据 fusion_mode 执行不同逻辑 ---
         if self.fusion_mode == 'add':
             state_embedding = self.state_conditioner(initial_state)
             fused_features = stim_features + state_embedding.unsqueeze(1)
@@ -201,22 +200,30 @@ class S4DModel(nn.Module):
         prediction_transposed = self.output_proj(x)
         base_prediction = prediction_transposed.transpose(-1, -2)
 
-        if self.use_voltage_filter:
-            num_voltage_channels = self.output_channels - 1
-            soma_voltage_idx = num_voltage_channels - 1
-            spike_channel_idx = self.output_channels - 1
+        num_voltage_channels = self.output_channels - 1
+        spike_channel_idx = self.output_channels - 1
 
-            pred_voltage_part = base_prediction[:, :num_voltage_channels, :]
-            pred_spike_logits = base_prediction[:, spike_channel_idx, :].unsqueeze(1)
-            # --- ↓↓↓ 核心修改：准备电压本身和其导数作为双通道输入 ↓↓↓ ---
-            pred_soma_voltage = pred_voltage_part[:, soma_voltage_idx, :]
+        # 1. 分离原始的电压和脉冲输出
+        pred_voltage_part_raw = base_prediction[:, :num_voltage_channels, :]
+        pred_spike_logits_raw = base_prediction[:, spike_channel_idx, :].unsqueeze(1)
+
+        # 2. 只对电压部分应用1.1倍的Sigmoid激活
+        activated_voltage = torch.sigmoid(pred_voltage_part_raw) * 1.1
+
+        if self.use_voltage_filter:
+            # --- 新增的定义 ---
+            soma_voltage_idx = num_voltage_channels - 1  # 假设soma电压是电压通道中的最后一个
+            # -----------------
+
+            # 注意：这里的逻辑使用未经激活的原始电压来影响脉冲
+            pred_soma_voltage_raw = pred_voltage_part_raw[:, soma_voltage_idx, :]
 
             # 计算电压差分（近似导数）
-            pred_derivative = torch.diff(pred_soma_voltage, n=1, dim=-1)
+            pred_derivative = torch.diff(pred_soma_voltage_raw, n=1, dim=-1)
             pred_derivative = F.pad(pred_derivative, (1, 0), "constant", 0)
 
             # 将电压和导数拼接成一个 (B, 2, L) 的张量
-            input_voltage_for_filter = torch.stack([pred_soma_voltage, pred_derivative], dim=1)
+            input_voltage_for_filter = torch.stack([pred_soma_voltage_raw, pred_derivative], dim=1)
 
             # 如果是训练且提供了目标，则使用混合信号
             if self.training and target_v1 is not None:
@@ -224,20 +231,18 @@ class S4DModel(nn.Module):
                 true_derivative = torch.diff(true_soma_voltage, n=1, dim=-1)
                 true_derivative = F.pad(true_derivative, (1, 0), "constant", 0)
 
-                # 分别混合电压和导数
-                mixed_soma_voltage = (pred_soma_voltage + true_soma_voltage) / 2.0
+                mixed_soma_voltage = (pred_soma_voltage_raw + true_soma_voltage) / 2.0
                 mixed_derivative = (pred_derivative + true_derivative) / 2.0
-
-                # 拼接成双通道
                 input_voltage_for_filter = torch.stack([mixed_soma_voltage, mixed_derivative], dim=1)
 
-            # 通过可学习的卷积核 (注意输入不再需要 .unsqueeze(1))
             filter_effect = self.voltage_to_spike_filter(input_voltage_for_filter)
 
-            final_spike_logits = pred_spike_logits + filter_effect
-            return torch.cat([pred_voltage_part, final_spike_logits], dim=1)
+            final_spike_logits = pred_spike_logits_raw + filter_effect
+            # 3. 组合已激活的电压和最终的脉冲logits
+            return torch.cat([activated_voltage, final_spike_logits], dim=1)
         else:
-            return base_prediction
+            # 3. 组合已激活的电压和原始的脉冲logits
+            return torch.cat([activated_voltage, pred_spike_logits_raw], dim=1)
 
     @torch.no_grad()
     def generate(self, stimulus_seq, initial_state):
@@ -267,7 +272,18 @@ class S4DModel(nn.Module):
             predictions.append(out_step)
 
         predictions = torch.stack(predictions, dim=1)  # (B, L, C)
-        return predictions.transpose(-1, -2)  # (B, C, L)
+        raw_output = predictions.transpose(-1, -2)  # (B, C, L)
+
+        # 1. 分离原始的电压和脉冲输出
+        num_voltage_channels = self.output_channels - 1
+        pred_voltage_part_raw = raw_output[:, :num_voltage_channels, :]
+        pred_spike_logits_raw = raw_output[:, num_voltage_channels:, :]
+
+        # 2. 只对电压部分应用1.1倍的Sigmoid激活
+        activated_voltage = torch.sigmoid(pred_voltage_part_raw) * 1.1
+
+        # 3. 组合已激活的电压和原始的脉冲logits
+        return torch.cat([activated_voltage, pred_spike_logits_raw], dim=1)
 
 
 # =============================================================================
