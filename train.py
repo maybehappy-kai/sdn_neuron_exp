@@ -356,6 +356,8 @@ def main(args):
         run_id += "_vf-off"
     # --- ↑↑↑ 修改结束 ↑↑↑ ---
 
+    run_id += f"_v-act-{args.voltage_activation}"
+
     run_dir = os.path.join(args.output_dir, run_id)
     os.makedirs(run_dir, exist_ok=True)
     setup_logging(os.path.join(run_dir, 'run.log'))
@@ -383,13 +385,15 @@ def main(args):
             tcn_kernel_size=args.tcn_kernel_size,
             dropout=args.dropout,
             fusion_mode=args.fusion_mode,
-            use_voltage_filter=args.use_voltage_filter
+            use_voltage_filter=args.use_voltage_filter,
+            voltage_activation=args.voltage_activation
         ).to(device)
     elif args.model == 's4d':
         model = S4DModel(
             input_channels=input_channels, output_channels=output_channels,  # <--- 使用动态通道数
             d_model=args.d_model, n_layers=args.n_layers,
-            d_state=args.d_state, l_max=args.seq_len, dropout=args.dropout, fusion_mode=args.fusion_mode, use_voltage_filter=args.use_voltage_filter
+            d_state=args.d_state, l_max=args.seq_len, dropout=args.dropout, fusion_mode=args.fusion_mode, use_voltage_filter=args.use_voltage_filter,
+            voltage_activation=args.voltage_activation
         ).to(device)
 
     logging.info(f"Model: {args.model}")
@@ -476,13 +480,15 @@ def main(args):
             tcn_kernel_size=args.tcn_kernel_size,
             dropout=args.dropout,
             fusion_mode=args.fusion_mode,
-            use_voltage_filter = args.use_voltage_filter
+            use_voltage_filter = args.use_voltage_filter,
+            voltage_activation=args.voltage_activation
         ).to(device)
     elif args.model == 's4d':
         model = S4DModel(
             input_channels=input_channels, output_channels=output_channels, # <--- 修改这里
             d_model=args.d_model, n_layers=args.n_layers,
-            d_state=args.d_state, l_max=args.seq_len, dropout=args.dropout, fusion_mode=args.fusion_mode, use_voltage_filter=args.use_voltage_filter
+            d_state=args.d_state, l_max=args.seq_len, dropout=args.dropout, fusion_mode=args.fusion_mode, use_voltage_filter=args.use_voltage_filter,
+            voltage_activation=args.voltage_activation
         ).to(device)
 
     model.load_state_dict(torch.load(os.path.join(run_dir, 'best_model.pth')))
@@ -584,12 +590,14 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=100, help='Max number of epochs.')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate.')
     parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay.')
-    parser.add_argument('--patience', type=int, default=10, help='Early stopping patience.')
+    parser.add_argument('--patience', type=int, default=100, help='Early stopping patience.')
     parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate.')
     parser.add_argument('--overlap_size', type=int, default=256,
                         help='Overlap size for autoregressive generation window.')
     parser.add_argument('--fusion_mode', type=str, default='add', choices=['add', 'ablate'],
                         help="How to fuse initial state. 'add': add to stimulus features, 'ablate': ignore initial state.")
+    parser.add_argument('--voltage_activation', type=str, default='linear', choices=['linear', 'custom_x2'],
+                        help="Activation function for the voltage output head.")
     parser.add_argument('--use_voltage_filter', type=lambda x: (str(x).lower() == 'true'), default=False,
                         help="Enable the biexponential filter from voltage to spike logits (e.g., --use_voltage_filter True).")
 

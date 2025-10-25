@@ -7,6 +7,28 @@ from typing import List
 import torch.nn.functional as F
 
 
+class CustomVoltageActivation(nn.Module):
+    """
+    自定义激活函数 (已修正为开区间):
+    - f(x) = x^2  (如果 0 < x < 1)  <--- 变化在这里
+    - f(x) = x    (其他情况, 即 x <= 0 或 x >= 1)
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 1. 创建条件 mask，找到在 (0, 1) 开区间内的所有元素
+        # --- ↓↓↓ 关键修改：去掉了等号 ↓↓↓ ---
+        condition = (x > 0) & (x < 1)
+        # --- ↑↑↑ 修改结束 ↑↑↑ ---
+
+        # 2. 使用 torch.where 高效地应用分段函数
+        # - 如果为 True (即 0 < x < 1), 则应用 x**2
+        # - 如果为 False (即 x <= 0 或 x >= 1), 则保持 x 不变
+        return torch.where(condition, x ** 2, x)
+
+
 class TemporalBlock(nn.Module):
     """
     TCN的基本残差模块。
@@ -30,13 +52,13 @@ class TemporalBlock(nn.Module):
         self.conv1 = weight_norm(nn.Conv1d(n_inputs, n_outputs, kernel_size,
                                            stride=stride, padding=padding, dilation=dilation))
         # 激活函数和Dropout
-        self.relu1 = nn.ReLU()
+        self.relu1 = nn.GELU()
         self.dropout1 = nn.Dropout(dropout)
 
         # 第二个卷积层
         self.conv2 = weight_norm(nn.Conv1d(n_outputs, n_outputs, kernel_size,
                                            stride=stride, padding=padding, dilation=dilation))
-        self.relu2 = nn.ReLU()
+        self.relu2 = nn.GELU()
         self.dropout2 = nn.Dropout(dropout)
 
         # 将上述层按顺序组合
@@ -45,7 +67,7 @@ class TemporalBlock(nn.Module):
 
         # 如果输入输出通道数不同，需要一个1x1卷积来匹配维度以便进行残差连接
         self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
-        self.relu = nn.ReLU()
+        self.relu = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.net(x)
@@ -63,7 +85,9 @@ class TCNModel(nn.Module):
 
     def __init__(self, input_channels: int, output_channels: int, num_hidden_channels: List[int],
                  input_kernel_size: int, tcn_kernel_size: int, dropout: float = 0.2, fusion_mode: str = 'add',
-                 use_voltage_filter: bool = False):
+                 use_voltage_filter: bool = False,
+                 # --- ↓↓↓ 添加这个新参数 ↓↓↓ ---
+                 voltage_activation: str = 'linear'):
         super(TCNModel, self).__init__()
         self.fusion_mode = fusion_mode
         self.use_voltage_filter = use_voltage_filter  # <-- 保存参数
@@ -101,14 +125,21 @@ class TCNModel(nn.Module):
 
         self.output_layer = nn.Conv1d(num_hidden_channels[-1], output_channels, 1)
 
+        # --- ↓↓↓ 添加这个逻辑块 ↓↓↓ ---
+        if voltage_activation == 'linear':
+            self.voltage_activation = nn.Identity()
+        elif voltage_activation == 'custom_x2':
+            self.voltage_activation = CustomVoltageActivation()
+        else:
+            raise ValueError(f"未知的 voltage_activation: {voltage_activation}")
+        # --- ↑↑↑ 添加结束 ↑↑↑ ---
+
         if self.use_voltage_filter:
-            self.voltage_to_spike_filter = nn.Sequential(
-                # --- ↓↓↓ 将 in_channels 从 1 修改为 2 ↓↓↓ ---
-                # <--- 修改: 使用 'causal'  padding 来防止数据泄漏 ---
-                nn.Conv1d(in_channels=2, out_channels=8, kernel_size=256, padding='causal', bias=False),
-                nn.ReLU(),
-                nn.Conv1d(in_channels=8, out_channels=1, kernel_size=1)
-            )
+            # 不要再使用 nn.Sequential
+            self.voltage_filter_conv1 = nn.Conv1d(in_channels=2, out_channels=8, kernel_size=256, padding=0,
+                                                  bias=False)  # 改为 padding=0
+            self.voltage_filter_relu = nn.GELU()  # 保持一致使用 GELU
+            self.voltage_filter_conv2 = nn.Conv1d(in_channels=8, out_channels=1, kernel_size=1)
 
     def forward(self, stimulus_seq: torch.Tensor, initial_state: torch.Tensor,
                 target_v1: torch.Tensor = None) -> torch.Tensor:
@@ -141,7 +172,7 @@ class TCNModel(nn.Module):
 
         # 2. 只对电压部分应用1.1倍的Sigmoid激活
         # activated_voltage = torch.sigmoid(pred_voltage_part_raw) * 1.1
-        activated_voltage = pred_voltage_part_raw
+        activated_voltage = self.voltage_activation(pred_voltage_part_raw)
 
         if self.use_voltage_filter:
             # --- 新增的定义 ---
@@ -156,6 +187,7 @@ class TCNModel(nn.Module):
             pred_derivative = F.pad(pred_derivative, (1, 0), "constant", 0)
 
             # 将电压和导数拼接成一个 (B, 2, L) 的张量
+            # 这是默认的滤波器输入 (用于验证/测试)
             input_voltage_for_filter = torch.stack([pred_soma_voltage_raw, pred_derivative], dim=1)
 
             # 如果是训练且提供了目标，则使用混合信号
@@ -166,15 +198,31 @@ class TCNModel(nn.Module):
 
                 mixed_soma_voltage = (pred_soma_voltage_raw + true_soma_voltage) / 2.0
                 mixed_derivative = (pred_derivative + true_derivative) / 2.0
+
+                # --- 仅在训练时覆盖滤波器输入 ---
                 input_voltage_for_filter = torch.stack([mixed_soma_voltage, mixed_derivative], dim=1)
 
-            filter_effect = self.voltage_to_spike_filter(input_voltage_for_filter)
+            # --- 修正：将滤波器应用逻辑移到 'if' 块之外 ---
+            # 无论是否在训练，都必须应用滤波器
 
+            # 1. 手动实现因果填充
+            # kernel_size = 256, 所以我们需要 255 的左侧填充
+            padded_input = F.pad(input_voltage_for_filter, (255, 0), "constant", 0)
+
+            # 2. 手动应用 filter 的各个层
+            x_filter = self.voltage_filter_conv1(padded_input)
+            x_filter = self.voltage_filter_relu(x_filter)
+            filter_effect = self.voltage_filter_conv2(x_filter)
+
+            # 3. 计算最终 logits
             final_spike_logits = pred_spike_logits_raw + filter_effect
-            # 3. 组合已激活的电压和最终的脉冲logits
+
+            # 4. 组合已激活的电压和最终的脉冲logits
             return torch.cat([activated_voltage, final_spike_logits], dim=1)
+
         else:
-            # 3. 组合已激活的电压和原始的脉冲logits
+            # (如果 use_voltage_filter 为 False, 则执行此操作)
+            # 组合已激活的电压和原始的脉冲logits
             return torch.cat([activated_voltage, pred_spike_logits_raw], dim=1)
 
 # =============================================================================

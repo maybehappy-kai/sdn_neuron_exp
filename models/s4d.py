@@ -8,6 +8,28 @@ from typing import List
 import torch.nn.functional as F
 
 
+class CustomVoltageActivation(nn.Module):
+    """
+    自定义激活函数 (已修正为开区间):
+    - f(x) = x^2  (如果 0 < x < 1)  <--- 变化在这里
+    - f(x) = x    (其他情况, 即 x <= 0 或 x >= 1)
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 1. 创建条件 mask，找到在 (0, 1) 开区间内的所有元素
+        # --- ↓↓↓ 关键修改：去掉了等号 ↓↓↓ ---
+        condition = (x > 0) & (x < 1)
+        # --- ↑↑↑ 修改结束 ↑↑↑ ---
+
+        # 2. 使用 torch.where 高效地应用分段函数
+        # - 如果为 True (即 0 < x < 1), 则应用 x**2
+        # - 如果为 False (即 x <= 0 或 x >= 1), 则保持 x 不变
+        return torch.where(condition, x ** 2, x)
+
+
 
 class S4D(nn.Module):
     """
@@ -152,7 +174,7 @@ class S4DModel(nn.Module):
 
     def __init__(self, input_channels, output_channels, d_model, n_layers, d_state=64, l_max=1024, dropout=0.1,
                  fusion_mode: str = 'add',
-                 use_voltage_filter: bool = False):
+                 use_voltage_filter: bool = False, voltage_activation: str = 'linear'):
         super(S4DModel, self).__init__()
         self.d_model = d_model
         self.fusion_mode = fusion_mode
@@ -168,14 +190,21 @@ class S4DModel(nn.Module):
 
         self.output_proj = nn.Linear(d_model, output_channels)
 
+        # --- ↓↓↓ 添加这个逻辑块 ↓↓↓ ---
+        if voltage_activation == 'linear':
+            self.voltage_activation = nn.Identity()
+        elif voltage_activation == 'custom_x2':
+            self.voltage_activation = CustomVoltageActivation()
+        else:
+            raise ValueError(f"未知的 voltage_activation: {voltage_activation}")
+        # --- ↑↑↑ 添加结束 ↑↑↑ ---
+
         if self.use_voltage_filter:
-            self.voltage_to_spike_filter = nn.Sequential(
-                # --- ↓↓↓ 将 in_channels 从 1 修改为 2 ↓↓↓ ---
-                # <--- 修改: 使用 'causal'  padding 来防止数据泄漏 ---
-                nn.Conv1d(in_channels=2, out_channels=8, kernel_size=256, padding='causal', bias=False),
-                nn.ReLU(),
-                nn.Conv1d(in_channels=8, out_channels=1, kernel_size=1)
-            )
+            # --- ↓↓↓ 修改：分解为独立的层，并将 padding 改为 0 ↓↓↓ ---
+            self.voltage_filter_conv1 = nn.Conv1d(in_channels=2, out_channels=8, kernel_size=256, padding=0, bias=False)
+            self.voltage_filter_relu = nn.GELU()  # 同样使用 GELU 保持一致
+            self.voltage_filter_conv2 = nn.Conv1d(in_channels=8, out_channels=1, kernel_size=1)
+            # --- ↑↑↑ 修改结束 ↑↑↑ ---
 
     def forward(self, stimulus_seq, initial_state, target_v1: torch.Tensor = None):
         """ 并行模式 (用于训练) """
@@ -210,7 +239,7 @@ class S4DModel(nn.Module):
 
         # 2. 只对电压部分应用1.1倍的Sigmoid激活
         # activated_voltage = torch.sigmoid(pred_voltage_part_raw) * 1.1
-        activated_voltage = pred_voltage_part_raw
+        activated_voltage = self.voltage_activation(pred_voltage_part_raw)
 
         if self.use_voltage_filter:
             # --- 新增的定义 ---
@@ -237,7 +266,12 @@ class S4DModel(nn.Module):
                 mixed_derivative = (pred_derivative + true_derivative) / 2.0
                 input_voltage_for_filter = torch.stack([mixed_soma_voltage, mixed_derivative], dim=1)
 
-            filter_effect = self.voltage_to_spike_filter(input_voltage_for_filter)
+            padded_input = F.pad(input_voltage_for_filter, (255, 0), "constant", 0)
+
+            # 手动应用 filter 的各个层
+            x_filter = self.voltage_filter_conv1(padded_input)
+            x_filter = self.voltage_filter_relu(x_filter)
+            filter_effect = self.voltage_filter_conv2(x_filter)
 
             final_spike_logits = pred_spike_logits_raw + filter_effect
             # 3. 组合已激活的电压和最终的脉冲logits
@@ -281,8 +315,8 @@ class S4DModel(nn.Module):
         pred_voltage_part_raw = raw_output[:, :num_voltage_channels, :]
         pred_spike_logits_raw = raw_output[:, num_voltage_channels:, :]
 
-        # 2. 只对电压部分应用1.1倍的Sigmoid激活
-        activated_voltage = torch.sigmoid(pred_voltage_part_raw) * 1.1
+        # 2. 对电压部分应用自定义激活函数
+        activated_voltage = self.voltage_activation(pred_voltage_part_raw)
 
         # 3. 组合已激活的电压和原始的脉冲logits
         return torch.cat([activated_voltage, pred_spike_logits_raw], dim=1)
