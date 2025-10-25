@@ -104,7 +104,8 @@ class TCNModel(nn.Module):
         if self.use_voltage_filter:
             self.voltage_to_spike_filter = nn.Sequential(
                 # --- ↓↓↓ 将 in_channels 从 1 修改为 2 ↓↓↓ ---
-                nn.Conv1d(in_channels=2, out_channels=8, kernel_size=256, padding='same', bias=False),
+                # <--- 修改: 使用 'causal'  padding 来防止数据泄漏 ---
+                nn.Conv1d(in_channels=2, out_channels=8, kernel_size=256, padding='causal', bias=False),
                 nn.ReLU(),
                 nn.Conv1d(in_channels=8, out_channels=1, kernel_size=1)
             )

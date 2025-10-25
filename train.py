@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve
 
 from models.tcn import TCNModel
 from models.s4d import S4DModel
@@ -81,6 +82,9 @@ def get_datasets(data_dir, dataset_name, seq_len):
 
     total_timesteps = v0_full.shape[1]
 
+    # --- 新增: 创建一个包含完整数据的Dataset对象 ---
+    full_dataset = NeuronDataset(v0_full, v1_full, seq_len)
+
     # 按 6:1:3 的比例在时间轴上分割
     train_end_idx = int(total_timesteps * 0.6)
     val_end_idx = int(total_timesteps * 0.7)
@@ -96,11 +100,12 @@ def get_datasets(data_dir, dataset_name, seq_len):
 
     logging.info(
         f"Datasets created. Train: {len(train_dataset.v0[0])}, Val: {len(val_dataset.v0[0])}, Test: {len(test_dataset.v0[0])} timesteps.")
-    return train_dataset, val_dataset, test_dataset, input_channels, output_channels
+    # --- 修改: 额外返回 full_dataset ---
+    return train_dataset, val_dataset, test_dataset, full_dataset, input_channels, output_channels
 
 
 # --- 4. 性能指标计算 ---
-def calculate_metrics(predictions, targets, output_channels):
+def calculate_metrics(predictions, targets, output_channels, optimal_threshold=None):
     metrics = {}
 
     # 分离电压和脉冲 (动态地)
@@ -115,8 +120,40 @@ def calculate_metrics(predictions, targets, output_channels):
     ss_tot = torch.sum((target_voltage - torch.mean(target_voltage)) ** 2)
     metrics['voltage_ve'] = (1 - ss_res / ss_tot).item()
 
-    # 精确率, 召回率, F1
-    preds_binary = (torch.sigmoid(pred_spike_logits) > 0.5).float()
+    # --- ↓↓↓ 最佳阈值计算 (已修正) ↓↓↓ ---
+
+    # 1. 获取概率
+    spike_probs = torch.sigmoid(pred_spike_logits)
+
+    # 2. 准备ROC曲线所需的数据
+    y_true_np = target_spike.cpu().numpy().ravel()
+
+    # 3. 仅在未提供阈值时才计算 (例如在验证集上)
+    if optimal_threshold is None:
+        y_scores_np = spike_probs.cpu().numpy().ravel()
+
+        # 确保至少有一个正样本和一个负样本，否则roc_curve会报错
+        if len(np.unique(y_true_np)) > 1:
+            fpr, tpr, thresholds = roc_curve(y_true_np, y_scores_np)
+
+            # 找到最佳阈值 (使用Youden's J statistic: tpr - fpr)
+            j_scores = tpr - fpr
+            optimal_idx = np.argmax(j_scores)
+            optimal_threshold = thresholds[optimal_idx]
+            # 处理可能的nan值（虽然罕见）
+            if np.isnan(optimal_threshold):
+                optimal_threshold = 0.5
+        else:
+            # 如果所有样本都是同一个类别，则无法计算ROC，回退到0.5
+            optimal_threshold = 0.5
+
+    # --- ↑↑↑ 修正结束 (已删除重复代码) ↑↑↑ ---
+
+    metrics['spike_threshold'] = float(optimal_threshold)
+
+    # 精确率, 召回率, F1 (使用最佳阈值)
+    preds_binary = (spike_probs > optimal_threshold).float()
+
     tp = torch.sum(preds_binary * target_spike)
     fp = torch.sum(preds_binary * (1 - target_spike))
     fn = torch.sum((1 - preds_binary) * target_spike)
@@ -129,13 +166,13 @@ def calculate_metrics(predictions, targets, output_channels):
     metrics['spike_recall'] = recall.item()
     metrics['spike_f1'] = f1.item()
 
-    return metrics
+    return metrics, float(optimal_threshold)
 
 
 # --- 5. 评估函数 (自回归生成) ---
 # [最终修正版 v3 - 简洁正确]
 @torch.no_grad()
-def evaluate(model, dataset, device, seq_len, overlap_size, output_channels, return_predictions=False):
+def evaluate(model, dataset, device, seq_len, overlap_size, output_channels, return_predictions=False, optimal_threshold=None):
     model.eval()
 
     num_voltage_channels = output_channels - 1  # <--- 在函数开头定义
@@ -196,15 +233,19 @@ def evaluate(model, dataset, device, seq_len, overlap_size, output_channels, ret
     final_prediction = torch.cat(all_predictions, dim=2)
     final_target = full_v1_target[:, :, 1:final_prediction.shape[2] + 1]
 
-    metrics = calculate_metrics(final_prediction, final_target, output_channels)  # <--- 传递参数
+    # <--- 修改: 传递阈值参数 ---
+    metrics, optimal_threshold = calculate_metrics(final_prediction, final_target, output_channels,
+                                                   optimal_threshold=optimal_threshold)
 
     if return_predictions:
-        return metrics, final_prediction, final_target  # <--- 如果标志为True，返回三个值
+        # <--- 修改: 额外返回阈值 ---
+        return metrics, final_prediction, final_target, optimal_threshold
     else:
-        return metrics  # <--- 否则，保持原样
+        # <--- 修改: 额外返回阈值 ---
+        return metrics, optimal_threshold
 
 
-def plot_test_results(predictions, targets, output_path, output_channels):
+def plot_test_results(predictions, targets, output_path, output_channels, optimal_threshold):
     """
     在测试集上生成并保存可视化对比图。
 
@@ -228,7 +269,7 @@ def plot_test_results(predictions, targets, output_path, output_channels):
     # --- 2. 提取脉冲数据 (最后一个通道) ---
     spike_logits_pred = preds_np[num_voltage_channels, :]
     spike_prob_pred = 1 / (1 + np.exp(-spike_logits_pred))  # Sigmoid激活
-    spike_binary_pred = (spike_prob_pred > 0.5).astype(int)
+    spike_binary_pred = (spike_prob_pred > optimal_threshold).astype(int)
     spike_true = targets_np[num_voltage_channels, :].astype(int)
 
     # --- 3. 计算 TP, FP, FN ---
@@ -328,8 +369,9 @@ def main(args):
     np.random.seed(42)
 
     # 加载数据
-    train_dataset, val_dataset, test_dataset, input_channels, output_channels = get_datasets(
-        os.path.expanduser(args.data_dir), args.dataset_name, args.seq_len)  # <--- 捕获通道数
+    # --- 修改: 捕获 full_dataset ---
+    train_dataset, val_dataset, test_dataset, full_dataset, input_channels, output_channels = get_datasets(
+        os.path.expanduser(args.data_dir), args.dataset_name, args.seq_len)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
 
     # 实例化模型
@@ -372,17 +414,18 @@ def main(args):
     best_val_ve = -float('inf')
     best_val_f1 = -float('inf')
     patience_counter = 0
+    best_val_threshold = 0.5  # 初始化一个默认值
 
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion_mse, criterion_bce, device,
                                      output_channels)  # <--- 传递
-        val_metrics = evaluate(model, val_dataset, device, args.seq_len, args.overlap_size, output_channels)  # <--- 传递
+        val_metrics, val_threshold = evaluate(model, val_dataset, device, args.seq_len, args.overlap_size, output_channels)  # <--- 传递
 
         scheduler.step()
 
         logging.info(f"Epoch {epoch}/{args.epochs} | Train Loss: {train_loss:.6f} | "
                      f"Val VE: {val_metrics['voltage_ve']:.4f} | Val F1: {val_metrics['spike_f1']:.4f} | "
-                     f"LR: {scheduler.get_last_lr()[0]:.6f}")
+                     f"Val Threshold: {val_threshold:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
 
         # 2. 检查模型是否满足新的保存条件：一方提升，另一方下降不超过其最佳值的10%
         current_ve = val_metrics['voltage_ve']
@@ -409,6 +452,7 @@ def main(args):
 
             # 重置耐心计数器并保存模型
             patience_counter = 0
+            best_val_threshold = val_threshold  # <--- 捕获与最佳模型对应的阈值
             torch.save(model.state_dict(), os.path.join(run_dir, 'best_model.pth'))
             logging.info(f"New best model found ({', '.join(improvement_message)}). Saving model.")
         else:
@@ -444,25 +488,61 @@ def main(args):
     model.load_state_dict(torch.load(os.path.join(run_dir, 'best_model.pth')))
 
     # +++ 修改部分 +++
+    # <--- 修改: 捕获测试集指标和最佳阈值 ---
     # 调用evaluate时，请求返回预测结果
-    test_metrics, test_preds, test_targets = evaluate(
-        model, test_dataset, device, args.seq_len, args.overlap_size, output_channels, return_predictions=True
-        # <--- 传递
+    test_metrics, test_preds, test_targets, test_threshold = evaluate(
+        model, test_dataset, device, args.seq_len, args.overlap_size, output_channels, return_predictions=True,
+        optimal_threshold=best_val_threshold  # <--- 修改: 传入在验证集上找到的最佳阈值
     )
+    # <--- 修改: 打印测试集阈值 ---
     logging.info(f"Final Test Metrics: {test_metrics}")
+    logging.info(f"Final Test Optimal Threshold: {test_threshold:.4f}")
 
     # 调用新的可视化函数
+    # <--- 修改: 传入最佳阈值用于绘图 ---
     plot_test_results(
         predictions=test_preds,
         targets=test_targets,
         output_path=os.path.join(run_dir, 'final_test_visualization.png'),
-        output_channels=output_channels
+        output_channels=output_channels,
+        optimal_threshold=test_threshold
     )
     # +++ 修改结束 +++
 
+    # --- 新增: 在完整数据集上进行评估和可视化 ---
+    logging.info("Evaluating on the FULL dataset for visualization...")
+    # 注意: 完整数据集可能非常大，这步可能很慢并消耗大量VRAM
+    try:
+        # <--- 修改: 传入 best_val_threshold 并在 full_threshold 中捕获它 ---
+        _, full_preds, full_targets, full_threshold = evaluate(
+            model, full_dataset, device, args.seq_len, args.overlap_size, output_channels, return_predictions=True,
+            optimal_threshold=best_val_threshold
+        )
+
+        # <--- 修改: 传入 full_threshold 用于绘图 ---
+        plot_test_results(
+            predictions=full_preds,
+            targets=full_targets,
+            output_path=os.path.join(run_dir, 'full_dataset_visualization.png'),
+            output_channels=output_channels,
+            optimal_threshold=full_threshold
+        )
+        logging.info(f"Full dataset visualization saved to {os.path.join(run_dir, 'full_dataset_visualization.png')}")
+
+    except RuntimeError as e:
+        # 捕获可能的 OOM (Out of Memory) 错误
+        logging.error(f"Failed to evaluate or plot on FULL dataset (possibly OOM): {e}")
+    # --- 新增结束 ---
+
     # 保存结果
     with open(os.path.join(run_dir, 'results.json'), 'w') as f:
-        json.dump({'args': vars(args), 'test_metrics': test_metrics}, f, indent=4)
+        # <--- 修改: 将 test_threshold 添加到结果文件中 ---
+        results_data = {
+            'args': vars(args),
+            'test_metrics': test_metrics,
+            'test_optimal_threshold': test_threshold
+        }
+        json.dump(results_data, f, indent=4)
 
     logging.info("Training finished.")
 
