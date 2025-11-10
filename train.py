@@ -18,23 +18,139 @@ from models.tcn import TCNModel
 from models.s4d import S4DModel
 
 
+# ===================================================================
+# --- 新增：自定义指数核初始化 ---
+# ===================================================================
+
+def init_exponential_kernels(weight_tensor: torch.Tensor, min_tau: float = 1.0, max_tau_ratio: float = 0.5):
+    """
+    使用随机幅度和时间常数的指数函数来初始化一个 1D 卷积核。
+
+    Args:
+        weight_tensor (torch.Tensor): 卷积层的权重张量 (out_channels, in_channels, kernel_size)
+        min_tau (float): 最小时间常数
+        max_tau_ratio (float): 最大时间常数，表示为 kernel_size 的比例
+    """
+    with torch.no_grad():
+        out_channels, in_channels, kernel_size = weight_tensor.shape
+
+        # 创建一个时间向量 (L-1, L-2, ..., 0)
+        # 这使得指数函数在最 "近" 的时间点 (kernel_size-1) 处值最大
+        # 这对于 TCN 的因果卷积是正确的
+        time_vector = torch.arange(kernel_size - 1, -1, -1, dtype=torch.float32, device=weight_tensor.device)
+
+        # 1. 为每个 (out_channel, in_channel) 对生成随机的时间常数 tau
+        # tau 范围: [min_tau, kernel_size * max_tau_ratio]
+        max_tau = max(min_tau + 1.0, kernel_size * max_tau_ratio)
+        # (B, A) 形状的随机张量
+        taus = torch.rand(out_channels, in_channels, device=weight_tensor.device) * (max_tau - min_tau) + min_tau
+
+        # 2. 为每个 (out_channel, in_channel) 对生成随机的幅度 A
+        # 使用标准正态分布 (randn) 来允许正核和负核
+        amplitudes = torch.randn(out_channels, in_channels, device=weight_tensor.device) * 0.1  # 缩小一点幅度
+
+        # 3. 使用广播计算所有核
+        # (O, I, 1) * exp( -(1, 1, K) / (O, I, 1) )
+        kernels = amplitudes.unsqueeze(-1) * torch.exp(-time_vector.unsqueeze(0).unsqueeze(0) / taus.unsqueeze(-1))
+
+        # 4. 将计算出的核赋给权重张量
+        weight_tensor.data.copy_(kernels)
+
+
+def apply_custom_init(model: nn.Module):
+    """
+    递归地遍历模型的所有模块，并对所有 kernel_size > 1 的 Conv1d 层
+    应用 init_exponential_kernels 初始化。
+    """
+    print("--- Applying custom exponential kernel initialization ---")
+    total_applied = 0
+    for module_name, m in model.named_modules():
+        if isinstance(m, nn.Conv1d):
+            # 关键检查: 只对时序卷积 (kernel_size > 1) 应用
+            # 跳过所有 1x1 卷积
+            if m.kernel_size[0] > 1:
+                print(f"Initializing layer: {module_name} (kernel_size={m.kernel_size[0]})")
+                init_exponential_kernels(m.weight)
+                total_applied += 1
+
+                # 同时初始化偏置为 0 (可选, 但通常是好的做法)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    print(f"--- Custom initialization applied to {total_applied} Conv1d layers. ---")
+
+
+# ===================================================================
+# --- 结束新增代码 ---
+# ===================================================================
+
+
 # --- 1. 自定义数据集类 (接受Numpy数组作为输入) ---
 class NeuronDataset(Dataset):
     def __init__(self, v0_data, v1_data, seq_len):
+        """
+        [已修改]
+        v0_data (numpy.ndarray): 输入数据, 形状 (C_in, T)
+        v1_data (numpy.ndarray): 目标数据, 形状 (C_out, T+1)
+        seq_len (int): 序列窗口长度
+        """
+        # 注意: 原始代码中的 'init' 已更正为 '__init__'
         self.v0 = torch.from_numpy(v0_data).float()
         self.v1 = torch.from_numpy(v1_data).float()
         self.seq_len = seq_len
-        self.total_timesteps = self.v0.shape[1]
+
+        # --- 关键修改: 预筛选有效的起始索引 ---
+
+        # 我们需要原始的 numpy 数组 (v0_data) 来进行高效的筛选
+        total_timesteps = v0_data.shape[1]
+
+        # 1. 创建所有可能的 start_idx
+        # 最后一个有效的 start_idx 是 total_timesteps - seq_len
+        possible_start_indices = np.arange(0, total_timesteps - seq_len + 1)
+
+        # 2. 检查每个窗口的输入 (v0_data) 是否全为 0
+        # 为了高效计算，我们避免使用 Python 循环
+        # 注意: 这里我们不能直接对 v0_data 使用滑动窗口，因为 v0_data 很大
+        # 我们将循环遍历，但使用 numpy 进行快速求和
+
+        self.valid_indices = []
+        logging.info(f"Scanning {total_timesteps - seq_len + 1} possible windows for non-zero inputs...")
+
+        for start_idx in possible_start_indices:
+            # 提取 v0_data (输入) 的窗口
+            # v0_data 形状为 (num_channels, time)
+            input_window = v0_data[:, start_idx : start_idx + seq_len]
+
+            # 检查窗口中是否至少有一个 1 (或任何非零值)
+            # np.sum() 在 numpy 数组上非常快
+            if np.sum(input_window) > 0:
+                self.valid_indices.append(start_idx)
+
+        logging.info(f"Found {len(self.valid_indices)} valid windows (with non-zero inputs).")
+
+        # 记录原始时间步长（可能用于评估）
+        self.total_timesteps = total_timesteps
 
     def __len__(self):
-        return self.total_timesteps - self.seq_len + 1
+        # --- 关键修改: 长度是有效切片的数量 ---
+        return len(self.valid_indices)
 
     def __getitem__(self, idx):
-        start_idx = idx
+        # --- 关键修改: 使用 valid_indices 映射索引 ---
+        # idx 是一个从 0 到 len(self)-1 的整数
+        # self.valid_indices[idx] 给了我们实际在 v0/v1 张量中的起始索引
+        start_idx = self.valid_indices[idx]
+
         end_idx = start_idx + self.seq_len
+
+        # 从 PyTorch 张量中切片
         v0_chunk = self.v0[:, start_idx:end_idx]
         v1_context = self.v1[:, start_idx]
+
+        # v1_target 的范围是 [start_idx + 1, end_idx + 1]
+        # 由于 v1 的长度是 T+1，这是安全的
         v1_target = self.v1[:, start_idx + 1:end_idx + 1]
+
         return v0_chunk, v1_context, v1_target
 
 
@@ -323,7 +439,7 @@ def train_one_epoch(model, loader, optimizer, criterion_mse, criterion_bce, devi
         loss = args.voltage_weight * loss_mse + args.spike_weight * loss_bce
 
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=100.0)
         optimizer.step()
 
         total_loss += loss.item()
@@ -395,6 +511,8 @@ def main(args):
             d_state=args.d_state, l_max=args.seq_len, dropout=args.dropout, fusion_mode=args.fusion_mode, use_voltage_filter=args.use_voltage_filter,
             voltage_activation=args.voltage_activation
         ).to(device)
+
+    # apply_custom_init(model)
 
     logging.info(f"Model: {args.model}")
     logging.info(f"Total parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
@@ -590,7 +708,7 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=100, help='Max number of epochs.')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate.')
     parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay.')
-    parser.add_argument('--patience', type=int, default=100, help='Early stopping patience.')
+    parser.add_argument('--patience', type=int, default=1000000, help='Early stopping patience.')
     parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate.')
     parser.add_argument('--overlap_size', type=int, default=256,
                         help='Overlap size for autoregressive generation window.')
@@ -604,7 +722,7 @@ if __name__ == '__main__':
     # 根据模型动态设置batch size和seq_len
     temp_args, _ = parser.parse_known_args()
     if temp_args.model == 'tcn':
-        parser.add_argument('--batch_size', type=int, default=1024, help='Batch size for TCN.')
+        parser.add_argument('--batch_size', type=int, default=2048, help='Batch size for TCN.')
         parser.add_argument('--seq_len', type=int, default=1024, help='Sequence length for TCN.')
         # TCN专属参数
         parser.add_argument('--hidden_channels', type=int, default=48)

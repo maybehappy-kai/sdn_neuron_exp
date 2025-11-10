@@ -9,24 +9,47 @@ import torch.nn.functional as F
 
 class CustomVoltageActivation(nn.Module):
     """
-    自定义激活函数 (已修正为开区间):
-    - f(x) = x^2  (如果 0 < x < 1)  <--- 变化在这里
-    - f(x) = x    (其他情况, 即 x <= 0 或 x >= 1)
+    自定义激活函数 (已修正为三段式 C^1 连续函数):
+    - f(x) = 2x                          (如果 x <= 0)
+    - f(x) = 2(x - 0.5)^3 + 0.5x + 0.25    (如果 0 < x < 1)
+    - f(x) = 2x - 1                      (如果 x >= 1)
+
+    该函数在 x=0 和 x=1 处 C^1 连续 (值和导数都连续)。
+    - 导数在 x=0.5 处为 0.5
+    - 导数在 x=0 和 x=1 处为 2，并平滑过渡到两侧的线性部分。
     """
 
     def __init__(self):
         super().__init__()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 1. 创建条件 mask，找到在 (0, 1) 开区间内的所有元素
-        # --- ↓↓↓ 关键修改：去掉了等号 ↓↓↓ ---
-        condition = (x > 0) & (x < 1)
-        # --- ↑↑↑ 修改结束 ↑↑↑ ---
+        # 1. 定义三个部分的计算
 
-        # 2. 使用 torch.where 高效地应用分段函数
-        # - 如果为 True (即 0 < x < 1), 则应用 x**2
-        # - 如果为 False (即 x <= 0 或 x >= 1), 则保持 x 不变
-        return torch.where(condition, x ** 2, x)
+        # 中间部分 (0 < x < 1)
+        poly_part = 2.0 * torch.pow(x - 0.5, 3) + 0.5 * x + 0.25
+
+        # 左侧部分 (x <= 0)
+        left_part = 2.0 * x
+
+        # 右侧部分 (x >= 1)
+        right_part = 2.0 * x - 1.0
+
+        # 2. 创建条件 masks
+        condition_mid = (x > 0) & (x < 1)
+        condition_left = (x <= 0)
+
+        # 3. 使用嵌套的 torch.where 高效地应用分段函数
+        #    (这比使用多个掩码和乘法更推荐)
+
+        # 3a. 首先, 构建 "非中间" (即 x <= 0 或 x >= 1) 的部分
+        #     - 如果 x <= 0, 使用 left_part
+        #     - 否则 (即 x >= 1), 使用 right_part
+        others_part = torch.where(condition_left, left_part, right_part)
+
+        # 3b. 然后, 构建最终结果
+        #     - 如果 0 < x < 1, 使用 poly_part
+        #     - 否则, 使用我们刚计算的 others_part
+        return torch.where(condition_mid, poly_part, others_part)
 
 
 class TemporalBlock(nn.Module):
@@ -86,35 +109,40 @@ class TCNModel(nn.Module):
     def __init__(self, input_channels: int, output_channels: int, num_hidden_channels: List[int],
                  input_kernel_size: int, tcn_kernel_size: int, dropout: float = 0.2, fusion_mode: str = 'add',
                  use_voltage_filter: bool = False,
-                 # --- ↓↓↓ 添加这个新参数 ↓↓↓ ---
                  voltage_activation: str = 'linear'):
         super(TCNModel, self).__init__()
         self.fusion_mode = fusion_mode
-        self.use_voltage_filter = use_voltage_filter  # <-- 保存参数
-        self.output_channels = output_channels  # <-- 保存通道数以供后续使用
+        self.use_voltage_filter = use_voltage_filter
+        self.output_channels = output_channels
 
-        # --- ★★★ 关键修改 1: 用一个TemporalBlock替换原来的第一层 ★★★ ---
-        # 我们现在使用一个完整的、带有残差连接的TemporalBlock作为“事件探测器”。
-        # 它的空洞因子固定为1，因为它负责初始的、非空洞的特征提取。
+        # --- ★★★ 关键修改 1: 添加一个独立的1x1卷积用于升维 ★★★ ---
+        # 这个层只负责将 20 通道 -> 48 通道，它没有残差连接
+        self.input_projection = nn.Conv1d(input_channels, num_hidden_channels[0], 1)
+        # --- 修改结束 ---
+
+        # --- ★★★ 关键修改 2: 修改 input_processor ★★★ ---
+        # 现在它的输入和输出通道数相同 (都等于 num_hidden_channels[0])
         self.input_processor = TemporalBlock(
-            n_inputs=input_channels,
-            n_outputs=num_hidden_channels[0],
+            n_inputs=num_hidden_channels[0],  # <-- [修改] 原为 input_channels
+            n_outputs=num_hidden_channels[0], # <-- [修改] 保持不变
             kernel_size=input_kernel_size,
             stride=1,
-            dilation=1,  # 第一层空洞因子为1
-            padding=(input_kernel_size - 1) * 1,  # 因果填充
+            dilation=1,
+            padding=(input_kernel_size - 1) * 1,
             dropout=dropout
         )
+        # 这样修改后, input_processor 内部的 n_inputs == n_outputs，
+        # self.downsample 将为 None, 残差路径将是恒等映射。
 
         # --- 状态调节模块 (不变) ---
         self.state_conditioner = nn.Linear(output_channels, num_hidden_channels[0])
 
-        # --- TCN核心 (逻辑微调，现在从第二层开始) ---
+        # --- TCN核心 (不变) ---
+        # (这部分已经是恒等映射了, 因为 num_hidden_channels 列表中的值都相同)
         layers = []
         num_levels = len(num_hidden_channels)
-        # 循环从i=1开始，因为i=0（第一层）已经被上面的input_processor处理了
         for i in range(1, num_levels):
-            dilation_size = 2 ** (i)  # 空洞因子从2开始
+            dilation_size = 2 ** (i)
             in_channels = num_hidden_channels[i - 1]
             out_channels = num_hidden_channels[i]
 
@@ -146,10 +174,16 @@ class TCNModel(nn.Module):
         """
         模型的前向传播 (已更新)
         """
-        # 1. 通过新的、更强大的输入处理器
-        stim_features = self.input_processor(stimulus_seq)
+        # --- ★★★ 关键修改 3: 在 input_processor 之前应用升维 ★★★ ---
+        # 1. 先用 1x1 卷积将 (B, 20, L) -> (B, 48, L)
+        projected_stimulus = self.input_projection(stimulus_seq)
 
-        # 2. 处理并广播初始状态
+        # 2. 将 (B, 48, L) 送入 input_processor
+        #    (input_processor 现在使用恒等映射残差连接)
+        stim_features = self.input_processor(projected_stimulus)
+        # --- 修改结束 (原为: stim_features = self.input_processor(stimulus_seq)) ---
+
+        # 3. 处理并广播初始状态 (不变)
         if self.fusion_mode == 'add':
             state_embedding = self.state_conditioner(initial_state)
             state_embedding_broadcasted = state_embedding.unsqueeze(2).expand_as(stim_features)
@@ -159,7 +193,7 @@ class TCNModel(nn.Module):
         else:
             raise ValueError(f"Unknown fusion mode: {self.fusion_mode}")
 
-        # 3. 通过TCN核心
+        # 4. 通过TCN核心 (不变)
         tcn_output = self.tcn_core(fused_features)
         base_prediction = self.output_layer(tcn_output)
 

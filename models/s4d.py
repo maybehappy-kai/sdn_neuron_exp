@@ -10,24 +10,47 @@ import torch.nn.functional as F
 
 class CustomVoltageActivation(nn.Module):
     """
-    自定义激活函数 (已修正为开区间):
-    - f(x) = x^2  (如果 0 < x < 1)  <--- 变化在这里
-    - f(x) = x    (其他情况, 即 x <= 0 或 x >= 1)
+    自定义激活函数 (已修正为三段式 C^1 连续函数):
+    - f(x) = 2x                          (如果 x <= 0)
+    - f(x) = 2(x - 0.5)^3 + 0.5x + 0.25    (如果 0 < x < 1)
+    - f(x) = 2x - 1                      (如果 x >= 1)
+
+    该函数在 x=0 和 x=1 处 C^1 连续 (值和导数都连续)。
+    - 导数在 x=0.5 处为 0.5
+    - 导数在 x=0 和 x=1 处为 2，并平滑过渡到两侧的线性部分。
     """
 
     def __init__(self):
         super().__init__()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 1. 创建条件 mask，找到在 (0, 1) 开区间内的所有元素
-        # --- ↓↓↓ 关键修改：去掉了等号 ↓↓↓ ---
-        condition = (x > 0) & (x < 1)
-        # --- ↑↑↑ 修改结束 ↑↑↑ ---
+        # 1. 定义三个部分的计算
 
-        # 2. 使用 torch.where 高效地应用分段函数
-        # - 如果为 True (即 0 < x < 1), 则应用 x**2
-        # - 如果为 False (即 x <= 0 或 x >= 1), 则保持 x 不变
-        return torch.where(condition, x ** 2, x)
+        # 中间部分 (0 < x < 1)
+        poly_part = 2.0 * torch.pow(x - 0.5, 3) + 0.5 * x + 0.25
+
+        # 左侧部分 (x <= 0)
+        left_part = 2.0 * x
+
+        # 右侧部分 (x >= 1)
+        right_part = 2.0 * x - 1.0
+
+        # 2. 创建条件 masks
+        condition_mid = (x > 0) & (x < 1)
+        condition_left = (x <= 0)
+
+        # 3. 使用嵌套的 torch.where 高效地应用分段函数
+        #    (这比使用多个掩码和乘法更推荐)
+
+        # 3a. 首先, 构建 "非中间" (即 x <= 0 或 x >= 1) 的部分
+        #     - 如果 x <= 0, 使用 left_part
+        #     - 否则 (即 x >= 1), 使用 right_part
+        others_part = torch.where(condition_left, left_part, right_part)
+
+        # 3b. 然后, 构建最终结果
+        #     - 如果 0 < x < 1, 使用 poly_part
+        #     - 否则, 使用我们刚计算的 others_part
+        return torch.where(condition_mid, poly_part, others_part)
 
 
 
